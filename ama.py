@@ -9,6 +9,11 @@
 #:      recursions                 - learn
 #:          batch
 #:      minimize                   - iter
+#: TODO
+#: constraints
+#:      multiple parameters?
+#:      radius = n lrn?
+#: stim
 
 
 import copy
@@ -16,7 +21,7 @@ import numpy as np
 import jax.numpy as jnp
 import jax.random as jxrandom
 import numpy.random as random
-from jax import grad,jit,vmap,lax
+from jax import grad,jit,vmap,lax,value_and_grad,tree_util,profiler
 from jax.scipy.stats import multivariate_normal as mvn
 import statsmodels.stats.moment_helpers as mh
 import matplotlib.pyplot as plt
@@ -24,6 +29,7 @@ import optax
 from functools import partial
 import Filter as filt
 from jax._src.numpy.util import promote_dtypes_inexact
+from dataclasses import dataclass
 
 
 def _get_copy_dict(instance,excl=[]):
@@ -360,16 +366,16 @@ class _Index():
     #- in
     @property
     def insert_exp(self):
-    # not jaxxed
+    # jaxxed
         #- in
         if self.bAnalytic:
             inds=[jnp.where(x>=0)[0] for x in self.x.fl]
         else:
             inds=[np.arange(self.shape_exp[i]) for i in range(self.ndim)]
 
-        in_index=np.union1d(self.ind_lrn,self.ind_rec) # to insert into f_prepped
+        in_index=jnp.union1d(self.ind_lrn,self.ind_rec) # to insert into f_prepped
         inds.append(in_index)
-        return np.ix_(*inds)
+        return jnp.ix_(*inds)
 
     @property
     def insert(self):
@@ -377,8 +383,8 @@ class _Index():
 
         mie=self.insert_exp
 
-        mi=np.ravel_multi_index(mie[:-1],self.dims)
-        return (jnp.array(mi),) + (jnp.array(mie[-1]),)
+        mi=jnp.ravel_multi_index(mie[:-1],self.dims)
+        return (mi,) + (mie[-1],)
 
 class Filter():
     index=None
@@ -405,7 +411,6 @@ class Filter():
 
         self.index=_Index(self,ind_lrn,ind_fix,ind_rec,bAnalytic)
 
-
         # out
         if not self.bNew:
             self.out=self.last
@@ -425,9 +430,11 @@ class Filter():
         prepped=np.zeros(self._shape_exp)
         prepped[...,self.index.recover]=self.out[...,self.index.recover]
         self.prepped_jx=jnp.array(np.reshape(prepped,self._shape),dtype=dtype)
+        self.prepped_exp_jx=jnp.array(prepped,dtype=dtype)
 
         # save insert index as a constant
         self._insert_index_jx=self.index.insert
+        self._insert_index_exp_jx=self.index.insert_exp
 
     def get_f0(self,rng_key,rand_fun):
     # jaxxed
@@ -437,17 +444,17 @@ class Filter():
         if len(jnp.shape(f00)) > 2:
             f00=f00[:,:,0]
 
-
         return f00[self.index.insert]
 
     def insert(self,fIn):
     # jaxxed
-        fNew=self.prepped_jx.at[self._insert_index_jx].set(fIn)
-        return fNew
+        return self.prepped_jx.at[self._insert_index_jx].set(fIn)
+
 
     def extract(self,fOut):
-        # NOT jaxxed
+    # jaxxed
         self.out=jnp.reshape(self.insert(fOut),self._shape_exp)
+
 #- PLOT
 
     def plot_out(self):
@@ -531,19 +538,41 @@ class Nrn():
         self._covMat_lower_index=jnp.array(jnp.tril(jnp.ones((n,n)),-1),dtype=bool)
 
 
+    @staticmethod
+    @partial(jit, static_argnames=['rmax'])
+    def respond(f,rmax,stim):
+        return rmax*jnp.einsum('ij,ikl->jkl',jnp.conjugate(f),stim)
+
+    @staticmethod
+    @jit
+    def insert(fIn,f_prepped,index):
+        return f_prepped.at[index].set(fIn)
+
+    @partial(jit, static_argnames=['self'])
     def lrn_main(self,rng_key,stim,fIn):
-        f=self.filter.insert(fIn)
+    # rmax
+    # eps
+    # sigma0
+    # _rShape
+    # _covDiag0
 
+        f=self.insert(fIn,self.filter.prepped_jx,self.filter._insert_index_jx)
 
-        rm   = self._rectify_fun(self.rmax*jnp.einsum('ij,ikl->jkl',jnp.conjugate(f),stim))
+        rm   = self._rectify_fun(self.respond(f,self.rmax,stim))
 
         # XXX todo, mv error
         Rm   = self._normalize_fun(rm,stim,f,self.eps)
 
-        nsVar = self.fano * jnp.abs(rm) + self.sigma0
-        covMat=self._corr_fun(nsVar)
+        nsVar = self._get_noise(self.fano,self.sigma0,rm)
+        covMat=self._corr_fun(nsVar,self._covDiag0,self.rho)
 
-        return Rm + self._noise_fun(rng_key,nsVar), Rm, covMat
+        return self._noise_fun(Rm,rng_key,nsVar), Rm, covMat
+
+
+    @staticmethod
+    @partial(jit, static_argnames=['fano','sigma0'])
+    def _get_noise(fano,sigma0,rm):
+        return fano * jnp.abs(rm) + sigma0
 
     #- max
     # RM??
@@ -563,59 +592,75 @@ class Nrn():
 
 
     #- noise
-    def _noise__true(self,rng_key,var):
-
+    @staticmethod
+    @partial(jit, static_argnames=['rng_key','var'])
+    def _noise__true(Rm,rng_key,var):
         [_,rng_key] = jxrandom.split(rng_key)
         # XXX is this right? does the first out need to be returned?
 
-        return jnp.reshape(
-            jxrandom.multivariate_normal(
-                rng_key,
-                jnp.zeros(var.size)[:,jnp.newaxis],
-                var.ravel()[:,jnp.newaxis,jnp.newaxis]
-            ),
-            self._rShape
-        )
-    def _noise__none(self,*_):
-        return 0
+        return Rm +  jxrandom.multivariate_normal(rng_key,
+                        jnp.zeros(var.size)[:,jnp.newaxis],
+                        var.ravel()[:,jnp.newaxis,jnp.newaxis],
+                        shape=Rm.shape)
+
+    @staticmethod
+    @jit
+    def _noise__none(Rm,*_):
+        return Rm
 
     #- recify
-    def _rectify__none(self,R):
+    @staticmethod
+    @jit
+    def _rectify__none(R):
         return R
 
-    def _rectify__true(self,R):
-        R[R < 0]=0
-        return R
+    @staticmethod
+    @jit
+    def _rectify__true(R):
+        return R.at[R < 0].set(0)
 
     #- normalize
-    def _normalize__none(self,R,*_):
+    @staticmethod
+    @jit
+    def _normalize__none(R,*_):
         return R
 
-    def _normalize__broad(self,R,stim,_,err):
+    @staticmethod
+    @jit
+    def _normalize__broad(R,stim,_,err):
         # TODO VMAP
         for i in range(jnp.shape(R)[0]):
             R=R.at[i,:].set(R.at[i,:]/(err+jnp.norm(stim.val[:,i])))
 
         return R
 
-    def _normalize__narrow(self,R,stim,f,err):
+    @staticmethod
+    @jit
+    def _normalize__narrow(R,stim,f,err):
         ## check this is the correct one
         # TODO
         return R/(err + jnp.vdot(jnp.transpose(stim.as_transpose),jnp.abs(f)))
 
-    def _corr__none(self,*_):
+    @staticmethod
+    @jit
+    def _corr__none(*_):
         return 0
 
-    def _corr__uncorr(self,nsVar):
+    @staticmethod
+    @jit
+    def _corr__uncorr(nsVar,covDiag0,*_):
         # noise variance
         # MATCH CONSTANT ADDITIVE TO AVERAGE SCALED ADDITIVE NOISE VARIANCE
         # INTERNAL FILTER RESPONSE COVARIANCE MATRIX (ASSUMING UNCORRELATED NOISE)
-        return jnp.diag(jnp.mean(jnp.square(nsVar)) * self._covDiag0)
 
-    def _corr_fun__corr(self,nsVar):
-        covMat=self._corr__uncorr(nsVar)
+        return jnp.diag(jnp.mean(jnp.square(nsVar)) * covDiag0)
 
-        C = mh.corr2cov(covMat,self.rho)
+    # TODO pytree-ize
+    @partial(jit, static_argnames=['self','rho'])
+    def _corr_fun__corr(self,nsVar,covDiag0,rho):
+        covMat=Nrn._corr__uncorr(nsVar,covDiag0)
+
+        C = mh.corr2cov(covMat,rho)
         covMat[self._covMat_upper_index] = C
         covMat[self._covMat_lower_index] = C
         return covMat
@@ -639,40 +684,43 @@ class Model():
         # XXX rm?
         self._lAll0=jnp.zeros((stim.nStim_Ctg, stim.nCtg, stim.nCtg),dtype=dtype)
 
+
+    @partial(jit, static_argnames=['self'])
     def lrn_main(self,R,Rm,covMat):
         return self._model_fun(*self._response_fun(R,Rm,covMat))
 
-    def _response__mean(self,_,Rm,covMat):
+    @staticmethod
+    @jit
+    def _response__mean(_,Rm,covMat):
         return Rm,Rm,covMat
 
-    def _response__basic(self,R,Rm,covMat):
+    @staticmethod
+    @jit
+    def _response__basic(R,Rm,covMat):
         return R, Rm, covMat
 
     #- models
-    def _model__gss(self,R,Rm,covMat):
-        # XXX check
+
+    #@partial(jit, static_argnames=['self'])
+    @staticmethod
+    @jit
+    def _model__gss(R,Rm,covMat):
         #: R   [ nF   x nStim_Ctg x ctg]
         #: lAll[nStim_ctg x ctg x ctg]
 
-
-
-        #def compute_pdf(R,r):
-        nStim_ctg=jnp.shape(R)[1]
-        nCtg=jnp.shape(R)[2]
-        nF=jnp.shape(R)[0]
-        out=jnp.zeros((nStim_ctg,nCtg,nCtg))
-
         R0=np.transpose(R-jnp.mean(R,axis=1,keepdims=True),(1,2,0))
-        #print(R0.shape)     #  3,51,2
-        #print(out.shape)    # 51, 2,2
-        #print(covMat.shape) # 3,3
-        vr=jnp.var(Rm,axis=1)
-        for c in range(nCtg):
-            out=out.at[:,:,c].set(lax.exp(lmvn0(R0,cov=jnp.diag(vr[:,c])+covMat)))
+        mvn=vmap(lambda cov_diag : lax.exp(lmvn0(R0,cov = jnp.diag(cov_diag) + covMat)), in_axes=(1,),out_axes=2)
+        return mvn(jnp.var(Rm,axis=1))
 
-
-        #out=vmap(compute_pdf)(R,R,(None, 2),2)
-        return out
+        # LOOP VERSION
+        #nStim_ctg=jnp.shape(R)[1]
+        #nCtg=jnp.shape(R)[2]
+        #vr=jnp.var(Rm,axis=1)
+        #nF=jnp.shape(R)[0]
+        #out=jnp.zeros((nStim_ctg,nCtg,nCtg))
+        #for c in range(nCtg):
+        #    out=out.at[:,:,c].set(lax.exp(lmvn0(R0,cov=jnp.diag(vr[:,c])+covMat)))
+        #return out
 
 
 
@@ -731,20 +779,27 @@ class Objective:
         self._yMin=jnp.min(stim.Y)
 
         self._yHat0=jnp.zeros((stim.nStim_Ctg,stim.nCtg),dtype=dtype)
-        self._correct0=jnp.zeros((stim.nStim_Ctg,stim.nCtg),dtype=dtype)
+        #self._correct0=jnp.zeros((stim.nStim_Ctg,stim.nCtg),dtype=dtype)
 
+    @partial(jit, static_argnames=['self'])
     def lrn_main(self,lAll,stimweights,yCtg):
         return self._loss_fun(self._err_fun(self._est_fun(self._posterior_fun(lAll)),yCtg),stimweights)
 
     #- post_fun
-    def _posterior__true(self,lAll):
+    @staticmethod
+    @jit
+    def _posterior__true(lAll):
         return lAll/jnp.sum(lAll,axis=1,keepdims=True)
 
-    def _posterior__none(self,lAll):
+    @staticmethod
+    @jit
+    def _posterior__none(lAll):
         return lAll
 
     #- estimation
-    def _est__none(self,post):
+    @staticmethod
+    @jit
+    def _est__none(post):
         return post
 
     def _est___med(self,post):
@@ -766,38 +821,45 @@ class Objective:
         return jnp.angle( jnp.sum( jnp.transpose(post) * jnp.exp(1j*self._Y_transpose) ) / sum(jnp.transpose(post)) )
 
     #- error
-    def _err__mle(self,lAll,_):
-        return jnp.log(self._at_correct(lAll))
+    @staticmethod
+    @jit
+    def _err__mle(lAll,_):
+        return jnp.log(Objective._at_correct(lAll))
 
-    def _err__map(self,pAll,_):
-        return -jnp.log(self._at_correct(pAll))
+    @staticmethod
+    @jit
+    def _err__map(pAll,_):
+        return -jnp.log(Objective._at_correct(pAll))
 
     def _err__l(self,yHat,yCtg):
         return jnp.jnp.pow(jnp.abs(yHat-yCtg),self.l)
 
     #- loss
-    def _loss__mean(self,err,stimweights):
+    @staticmethod
+    @jit
+    def _loss__mean(err,stimweights):
         return jnp.mean(err*stimweights)
 
-    def _loss__median(self,err,stimweights):
+    @staticmethod
+    @jit
+    def _loss__median(err,stimweights):
         return jnp.median(err*stimweights)
 
     #- helpers
-    def _at_correct(self,inAll):
-        lCorrect=self._correct0.copy()
+    @staticmethod
+    @jit
+    def _at_correct(inAll):
+        return jnp.diagonal(inAll, axis1=-2, axis2=-1)
 
-        # [nStim_ctg x ctg_stim x ctg ]
-        # [ nStim_ctg x ctg_stim ]
-
-        #    lCorrect.at[:,c].set(inAll[:,:,c])
-        #atC=lambda c : lCorrect.at[:,c].set(inAll[:,:,c])
-        nCtg=jnp.shape(inAll)[2]
-        for c in range(nCtg):
-            lCorrect=lCorrect.at[:,c].set(inAll.at[:,c,c].get())
-        return lCorrect
+        # LOOP VERSION
+        #lCorrect=jnp.zeros_like(inAll,shape=inAll.shape[:-1])
+        #for c in range(jnp.shape(inAll)[2])
+        #    lCorrect=lCorrect.at[:,c].set(inAll.at[:,c,c].get())
+        #return lCorrect
 
 class Optimizer():
-    def __init__(self,optimizerType='adam',projectionType=['l2_sphere',1],lRate0=1e-1,nIterMax=1000,f0_jxrand_fun=['ball',1]):
+    def __init__(self,optimizerType='adam',projectionType=['l2_ball',1],lRate0=1e-1,nIterMax=1000,f0_jxrand_fun=['ball',1]):
+        # ball is le instead of eq
         self.optimizerType=optimizerType
         self.projectionType=projectionType
         self.lRate0=lRate0
@@ -831,27 +893,60 @@ class Optimizer():
     def optimizer(self):
         return getattr(optax,self.optimizerType)
 
-    def minimize(self,rng,f0,stim,loss_fun):
+    @staticmethod
+    @partial(jit, static_argnames=['proj_fun'])
+    def insert_project_extract(params,prepped,index,proj_fun,proj_params):
+        out=params.copy()
+        fNew=prepped.at[index].set(params['f'])
+
+        # SLOW
+        vectorized_proj_fun = vmap(lambda f: proj_fun({'f': f}, *proj_params)['f'], in_axes=-1, out_axes=-1)
+        fNew_updated = fNew.at[..., :].set(vectorized_proj_fun(fNew))
+
+        out['f']=fNew_updated.at[index].get()
+        return out
+
+        #LOOP VERSIOn
+        #for i in range(filter._shape[-1]):
+        #    f=proj_fun({'f':fNew.at[...,i].get()},*proj_params) # XXX SLOW
+        #    fNew=fNew.at[...,i].set(f['f'])
+        #return out
+
+
+    def minimize(self,rng,f0,stim,filter,loss_fun):
         opt_fun=self.optimizer
-        proj_fun=self._projection
-        proj_params=self._projection_params
+
+        proj_fun_full=lambda params: self.insert_project_extract(params,filter.prepped_exp_jx,filter._insert_index_exp_jx,self._projection,self._projection_params)
 
         optimizer = opt_fun(self.lRate0)
 
         # f0
         [rng,rng_key] = jxrandom.split(rng)
         params = {"f": f0}
-
+        params = proj_fun_full(params)
         opt_state=optimizer.init(params)
 
-        for _ in range(self.nIterMax):
-            [rng,rng_key] = jxrandom.split(rng)
-            grads = grad(loss_fun)(params, rng_key, stim.val, stim.weights, stim.yCtg)
-            updates, opt_state = optimizer.update(grads, opt_state)
-            params = optax.apply_updates(params, updates)
-            params = proj_fun(params,*proj_params)
 
-        return params, opt_state
+        for i in range(self.nIterMax):
+            params, loss_value, opt_state,  rng = self.step(optimizer,params,loss_fun,proj_fun_full,opt_state,rng,stim)
+
+            if i % 100==0 or i==self.nIterMax-1:
+                print(f'step {i}, loss: {loss_value}')
+
+
+        return params, opt_state, rng
+
+
+    @staticmethod
+    @partial(jit, static_argnames=['stim','optimizer','loss_fun','proj_fun_full'])
+    def step(optimizer,params,loss_fun,proj_fun_full,opt_state,rng,stim):
+        [rng,rng_key] = jxrandom.split(rng)
+        loss_value, grads = value_and_grad(loss_fun)(params, rng_key, stim.val, stim.weights, stim.yCtg)
+        updates, opt_state = optimizer.update(grads, opt_state)
+        params = optax.apply_updates(params, updates)
+        cparams = proj_fun_full(params)
+
+        return cparams, loss_value, opt_state, rng
 
 class Trn:
     def __init__(self,nrn,model,objective,stim,seed=666):
@@ -898,8 +993,10 @@ class Iter:
         f0=self.nrn.filter.get_f0(rng_key,self.optimizer._f0_jxrand_fun)
 
         [self.rng,rng_key] = jxrandom.split(self.rng)
-        self.out_params,self.optstate=self.optimizer.minimize(rng_key,f0,self.stim,self.get_loss_fun())
-        self.nrn.filter.extact(self.out_params['f'])
+        self.out_params,self.optstate,rng=self.optimizer.minimize(rng_key,f0,self.stim,self.nrn.filter,self.loss_fun)
+        self.nrn.filter.extract(self.out_params['f'])
 
-    def get_loss_fun(self):
-        return lambda params, rng_key, stimval,stimweights, yCtg : self.objective.lrn_main(self.model.lrn_main(*self.nrn.lrn_main(rng_key,stimval,params['f'])),stimweights,yCtg)
+    @partial(jit, static_argnames=['self'])
+    def loss_fun(self,params,rng_key,stimval,stimweights,yCtg):
+        return self.objective.lrn_main(self.model.lrn_main(*self.nrn.lrn_main(rng_key,stimval,params['f'])),stimweights,yCtg)
+
