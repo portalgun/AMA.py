@@ -93,16 +93,16 @@ unit.plot_spinner()
 ## Models
 Model specifies how likelihoods are computed.
 `full`is the original, full AMA model
-`gss` is AMA-gauss assumes that class-conditional distributions are normally distributed (see https://jov.arvojournals.org/article.aspx?articleid=2659576)
+`gss` is AMA-gauss assumes that class-conditional distributions are normally distributed (see [Jaini & Burge 2017](https://jov.arvojournals.org/article.aspx?articleid=2659576))
 
-## Optimizaton algorithm 
-ama.py uses optax for optimization.  The list of supported optimizers are listed in the optax documentation (see https://optax.readthedocs.io/en/latest/api/optimizers.html)
+## Optimizaton algorithm
+ama.py uses optax for optimization.  The list of supported optimizers are listed in the [optax documentation](https://optax.readthedocs.io/en/latest/api/optimizers.html).
 
 ## Constraints
 Constrained optimization is a requirement for ama to work properly.
 Otherwise filters magnitude will continue to grow infinitely.
 AMA.py uses projections to perform constrained otpimizations, and is able to use
-any projection specified in optax (see https://optax.readthedocs.io/en/latest/api/projections.html).
+any projection specified in [optax documentation](https://optax.readthedocs.io/en/latest/api/projections.html).
 Note also that AMA.py also applies the specified constraint to each filter.
 
 When learning in the spatial domain, L2 constraints `L1_ball` or ` L1_sphere` is recommended.
@@ -116,11 +116,11 @@ When learning in the fourier domain, a sparsity constraint is  `l1_ball` or ` l1
 
 ## Initial filter vaues
 This simply specifies the distribution from which to pull initial filter values from.
-These can be any of the random samplers specified in `jax.random` (see https://jax.readthedocs.io/en/latest/jax.random.html#random-samplers)
+These can be any of the random samplers specified in `jax.random` [jax documentation](https://jax.readthedocs.io/en/latest/jax.random.html#random-samplers).
   * [ ] These are specified by `f0_jx_rand_fun` in the same way as constraints above,
 e.g. `['ball',1]` for `ball(_,1)` where `1` specified the dimension parameter `d`.
 
-## Fourier-domain learning 
+## Fourier-domain learning
 Stimuli can be loaded in the fourier domain and learned in spatio/temororal domain and vice versa.
 Whether or not data is learned in the fourier domain is specified by`fourierType` in the `Unit` class.
 
@@ -131,25 +131,24 @@ own sub-filter. This can be a more efficient way to learn filters, as it
 effectively allows sub-filters to be 'reused' in context with other filters.
 
 In order to use this splitting feature, the number of splits must be specified
-in `Stim` by `nSplit` and `bSplit=True` set in `Unit.` 
+in `Stim` by `nSplit` and `bSplit=True` set in `Unit.`
 
 ## Response Normalization
-ama.py currently supports two forms of neural response normalization---broadband <img src="https://latex.codecogs.com/svg.image?N_{brd}" title="N_{brd}" />
-narrowband <img src="https://latex.codecogs.com/svg.image?N_{brd}" title="N_{nrw}" />.
-A good explanation of these two types of normalization and how they differ can be found in [Burge & Iyer 2019(2)]
-(https://jov.arvojournals.org/article.aspx?articleid=2755285) (2).
+ama.py currently supports two forms of neural response normalization---broadband <img src="https://latex.codecogs.com/svg.image?N_{brd}" title="{color{Gray} N_{brd}}" />
+narrowband <img src="https://latex.codecogs.com/svg.image?N_{brd}" title="{color{Gray} N_{nrw}}" />.
+A good explanation of these two types of normalization and how they differ can be found in [Burge & Iyer 2019](https://jov.arvojournals.org/article.aspx?articleid=2755285) (2).
 
 ### Broadband
 Broadband normalization is simply the L2 norm of the stimulus contrast energy:
 
-<img src="https://latex.codecogs.com/svg.image?N_{brd}=||\mathbf&space;A_c||_2" title="N_{brd}=||\mathbf A_c||_2" />
+<img src="https://latex.codecogs.com/svg.image?N_{brd}=||\mathbf&space;A_c||_2" title="{color{Gray} N_{brd}=||\mathbf A_c||_2}" />
 
 Broadband normalization is stimulus specific but feature independent (2).
 
 ### Narrowband
 Narrowband normalization is the dot product between stimulus contrast energy and filter contrast energy:
 
-<img src="https://latex.codecogs.com/svg.image?N_{nrw}=\mathbf&space;A_c^\intercal\mathbf&space;A_f&space;" title="N_{nrw}=\mathbf A_c^\intercal\mathbf A_f" />
+<img src="https://latex.codecogs.com/svg.image?N_{nrw}=\mathbf&space;A_c^\intercal\mathbf&space;A_f&space;" title="{color{Gray} N_{nrw}=\mathbf A_c^\intercal\mathbf A_f}" />
 
 Narrowband normalization is stimulus specific but feature independent (2).
 
@@ -163,10 +162,11 @@ responseType
 - 'mean' = likelihoods based on mean responses
 - 'basic' = likelihoods based on noisey responses
 
-Normalization types:
-- None
+normalizationType:
+- 'None'
 - 'broadband'
 - 'narrowband'
+see 'Normalization' above
 
 fourierType
 - 0 = learning in spatio/temporal domain
@@ -181,14 +181,17 @@ modelTypes
 Binocular data from [White & Burge 2024](https://www.biorxiv.org/content/10.1101/2024.02.27.582383v3.full)
 - TODO full
 - TODO flattened
+
 Motion-in-depth data from [dheerrera1911/3D-motion_ideal_observer](https://github.com/dherrera1911/3D_motion_ideal_observer)
-- [OSF repository](https://osf.io/w9mpe/) 
-Disparity and speed data from (burgelab/AMA)[https://github.com/burgelab/AMA]
+- [OSF repository](https://osf.io/w9mpe/)
+
+Disparity and speed data from [burgelab/AMA](https://github.com/burgelab/AMA)
 - [AMAdataDisparity.mat](https://github.com/burgelab/AMA/raw/refs/heads/master/AMAdataDisparity.mat)
 - [AMAdataSpeed.mat](https://github.com/burgelab/AMA/raw/refs/heads/master/AMAdataSpeed.mat)
 
-## Other ama implementations
+## Other AMA implementations
 [burgelab/AMA](https://github.com/burgelab/AMA) - the original matlab implementation
+
 [dherrera/amatorch](https://github.com/dherrera1911/amatorch) - written in python with pytorch, features learning based on noise-covariance
 
 ## TODO
@@ -204,5 +207,9 @@ Disparity and speed data from (burgelab/AMA)[https://github.com/burgelab/AMA]
 (1) Burge J, Jaini P (2017). Accuracy Maximization Analysis for sensory-perceptual tasks: Computational improvements, filter robustness, and coding advantages for scaled additive noise.  PLoS Computational
 
    Biology, 13(2): e1005281. doi:10.1371/journal.pcbi.1005281
+
 (2) Iyer AV, Burge J (2019). The statistics of how natural images drive the responses of neurons. Journal of Vision, 19(13): 4, 1-25, doi: https://doi.org/10.1167/19.13.4
+
 (3) DN White, J Burge. How distinct sources of nuisance variability in natural images and scenes limit human stereopsis. Preprint. (582383). https://doi.org/10.1101/2024.02.27.582383
+
+(4) Jaini P, Burge J (2017). Linking normative models of natural tasks with descriptive models of neural response. Journal of Vision, 17(12):16, 1-26
