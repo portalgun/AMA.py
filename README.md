@@ -117,7 +117,7 @@ When learning in the fourier domain, a sparsity constraint is  `l1_ball` or ` l1
 ## Initial filter vaues
 This simply specifies the distribution from which to pull initial filter values from.
 These can be any of the random samplers specified in `jax.random` [jax documentation](https://jax.readthedocs.io/en/latest/jax.random.html#random-samplers).
-  * [ ] These are specified by `f0_jx_rand_fun` in the same way as constraints above,
+These are specified by `f0_jx_rand_fun` in the same way as constraints above,
 e.g. `['ball',1]` for `ball(_,1)` where `1` specified the dimension parameter `d`.
 
 ## Fourier-domain learning
@@ -134,21 +134,21 @@ In order to use this splitting feature, the number of splits must be specified
 in `Stim` by `nSplit` and `bSplit=True` set in `Unit.`
 
 ## Response Normalization
-ama.py currently supports two forms of neural response normalization---broadband <img src="https://latex.codecogs.com/svg.image?N_{brd}" title="{color{Gray} N_{brd}}" />
-narrowband <img src="https://latex.codecogs.com/svg.image?N_{brd}" title="{color{Gray} N_{nrw}}" />.
+ama.py currently supports two forms of neural response normalization---broadband <img src="https://latex.codecogs.com/svg.image?N_{brd}" title="{color{Cyan} N_{brd}}" />
+narrowband <img src="https://latex.codecogs.com/svg.image?N_{brd}" title="{color{Cyan} N_{nrw}}" />.
 A good explanation of these two types of normalization and how they differ can be found in [Burge & Iyer 2019](https://jov.arvojournals.org/article.aspx?articleid=2755285) (2).
 
 ### Broadband
 Broadband normalization is simply the L2 norm of the stimulus contrast energy:
 
-<img src="https://latex.codecogs.com/svg.image?N_{brd}=||\mathbf&space;A_c||_2" title="{color{Gray} N_{brd}=||\mathbf A_c||_2}" />
+<img src="https://latex.codecogs.com/svg.image?N_{brd}=||\mathbf&space;A_c||_2" title="{color{Cyan} N_{brd}=||\mathbf A_c||_2}" />
 
 Broadband normalization is stimulus specific but feature independent (2).
 
 ### Narrowband
 Narrowband normalization is the dot product between stimulus contrast energy and filter contrast energy:
 
-<img src="https://latex.codecogs.com/svg.image?N_{nrw}=\mathbf&space;A_c^\intercal\mathbf&space;A_f&space;" title="{color{Gray} N_{nrw}=\mathbf A_c^\intercal\mathbf A_f}" />
+<img src="https://latex.codecogs.com/svg.image?N_{nrw}=\mathbf&space;A_c^\intercal\mathbf&space;A_f&space;" title="{color{Cyan} N_{nrw}=\mathbf A_c^\intercal\mathbf A_f}" />
 
 Narrowband normalization is stimulus specific but feature independent (2).
 
