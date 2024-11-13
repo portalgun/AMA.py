@@ -4,14 +4,44 @@ Accuracy Maximization Analysis (AMA) in python with JAX and Optax
 AMA is a supervised learning algorithm that learns image-filters that best encode features for a given task, given the constraints of the visual system.
 See [Burge and Jaini 2017](https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1005281) (1).
 
+NOTE: this is under-development. Most features listed below have been implemented, those that have not are listed under 'TODO'
 
-JAX support provides:
-- autodiff
-- jit compliation
-- gpu support
-- auto-vectorization (no for loops)
 
-## Use
+## Ratinonale
+Previous implementations of AMA are limited in that they struggle to handle 2D images due to performance bottlenecks.
+This implementation aims to make AMA as fast as possible through JAX. JAX provides a huge increase in performance through:
+- autodiff 
+- jit compliation 
+- gpu support 
+- auto-vectorization 
+
+This implementation is also able to gain some performance increases by optionally learning in the fourier domain with/without learning Quadrature/Hilbert filter pairs.
+Learning filters in fourier domain allows one to take advantage of a sparsity constraint.
+Learning Quadrature/Hilbert pairs effectively learns two filters simultaneously with 1/4th the number of parameters.
+These features also allow efficient computation of narrow-band normalization---a feature exclusive to this implementation.
+
+For binocular images, additional performance can be gained by the "splitting" feature which splits the filter into two sub-filters.
+
+## Installation
+```
+git clone https://github.com/portalgun/AMA.py
+cd AMA.py
+pip install .
+```
+
+## Example Data
+Binocular data from [White & Burge 2024](https://www.biorxiv.org/content/10.1101/2024.02.27.582383v3.full)
+- TODO full
+- TODO flattened
+
+Motion-in-depth data from [dheerrera1911/3D-motion_ideal_observer](https://github.com/dherrera1911/3D_motion_ideal_observer)
+- [OSF repository](https://osf.io/w9mpe/)
+
+Disparity and speed data from [burgelab/AMA](https://github.com/burgelab/AMA)
+- [AMAdataDisparity.mat](https://github.com/burgelab/AMA/raw/refs/heads/master/AMAdataDisparity.mat)
+- [AMAdataSpeed.mat](https://github.com/burgelab/AMA/raw/refs/heads/master/AMAdataSpeed.mat)
+
+## Example Use
 ```python
 import ama
 import numpy as np
@@ -32,10 +62,10 @@ nrn=ama.Nrn(
              var0=0.23,              # base noise variance
              rmax=5.7                # max response,
              normalizeType='None',   # type of normalization
+             eps=0.001               # normalization epsilon
              bRectify=False,         # whether to recify responses
              bNoise=False,           # whether to use noise
              rho=0,                  # noise correlation
-             eps=0.001               # normalization eps
 )
 
 # set algorithm that determines likelihoods from responses
@@ -56,7 +86,7 @@ unit=ama.Unit(stim,nrn,model,objective)
 optimizer=a.Optimizer(
                       optimizerType='adam',         # optax algorithm
                       projectionType=['l2_ball',1], # constrained optimization
-                      lRate0=1e-1,                  # initial learn rate
+                      lRate0=1e-1,                  # initial learning rate
                       nIterMax=200,                 # max number of iterations
                       f0_jxrand_fun=['ball',1])     # how to generate initial filters
 
@@ -88,52 +118,57 @@ unit.plot_out()
 unit.plot_spinner()
 
 ```
-## Installation
 
-## Models
-Model specifies how likelihoods are computed.
-`full`is the original, full AMA model
-`gss` is AMA-gauss assumes that class-conditional distributions are normally distributed (see [Jaini & Burge 2017](https://jov.arvojournals.org/article.aspx?articleid=2659576))
+## Classes and Options
+### Stim
+```python
+stim=Stim(
+        x,                      # meshgrid for stimuli
+        stimuli,                # data
+        yCtgInd,                # label indeces
+        Y,                      # labels
+        bStimIsFourier=False,   # whether stimuli is in fourier domain
+        nSplit                  # number of natural splits data has (see below)
+        bStimIsSplit=False      # whether stimuli is already split
+)
+```
 
-## Optimizaton algorithm
-ama.py uses optax for optimization.  The list of supported optimizers are listed in the [optax documentation](https://optax.readthedocs.io/en/latest/api/optimizers.html).
+x - meshgird for stimulus, used for plotting
 
-## Constraints
-Constrained optimization is a requirement for ama to work properly.
-Otherwise filters magnitude will continue to grow infinitely.
-AMA.py uses projections to perform constrained otpimizations, and is able to use
-any projection specified in [optax documentation](https://optax.readthedocs.io/en/latest/api/projections.html).
-Note also that AMA.py also applies the specified constraint to each filter.
+stimuli - data
 
-When learning in the spatial domain, L2 constraints `L1_ball` or ` L1_sphere` is recommended.
+yCtgInd - label indeces
 
-When learning in the fourier domain, a sparsity constraint is  `l1_ball` or ` l1_sphere` is recommended.
+labels - labels
 
-### Examples
-`['l2_ball',1]` specifies optax `projection_l2_ball(_,1)`, where `1` is the scale paremter.
+bStimIsFourier - whether stimuli is in fourier domain
 
-`['box',-1, 1]` specifies optax `projection_box(_,-1,1)`, where `-1` and `1` are the `lower` and `upper` parameters.
+nSplit - number of natural splits data has
 
-## Initial filter vaues
-This simply specifies the distribution from which to pull initial filter values from.
-These can be any of the random samplers specified in `jax.random` [jax documentation](https://jax.readthedocs.io/en/latest/jax.random.html#random-samplers).
-These are specified by `f0_jx_rand_fun` in the same way as constraints above,
-e.g. `['ball',1]` for `ball(_,1)` where `1` specified the dimension parameter `d`.
+bStimIsSplit - whether stimuli is already split
 
-## Fourier-domain learning
-Stimuli can be loaded in the fourier domain and learned in spatio/temororal domain and vice versa.
-Whether or not data is learned in the fourier domain is specified by`fourierType` in the `Unit` class.
+### Nrn
+fano - fano factor. `1.36` default
 
-## Splitting
-Stereo/binocular data a single natural split (`nSplit=1`) between each stereo-half.
-When learning filters for stereo images, one can treat each stereo-half as its
-own sub-filter. This can be a more efficient way to learn filters, as it
-effectively allows sub-filters to be 'reused' in context with other filters.
+var0 - base noise variance. `0.23` default
 
-In order to use this splitting feature, the number of splits must be specified
-in `Stim` by `nSplit` and `bSplit=True` set in `Unit.`
+rmax - max response. `5.7` default. NOTE default subject to change.
 
-## Response Normalization
+eps = normalization epsilon, i.e. minimum normalization factor to prevent division by 0. default `0.001`.
+
+bRectify - whether to rectify responses. `False` default.
+
+bNoise   - whether to rectify responses. `False` default.
+
+rho - noise correlation
+- None = no noise
+- 0    = no noise correlation:w
+- !=0  = noise correlation
+
+normalizationType - type of response normalization to perform (see 'Normalization' above)
+- 'None'
+- 'broadband'
+- [ ] 'narrowband'
 ama.py currently supports two forms of neural response normalization---broadband <img src="https://latex.codecogs.com/svg.image?{\color{Gray}N_{brd}}" title="{\color{Gray} N_{brd}}" />
 narrowband <img src="https://latex.codecogs.com/svg.image?{\color{Gray}N_{brd}}" title="{\color{Gray} N_{nrw}}" />.
 A good explanation of these two types of normalization and how they differ can be found in [Burge & Iyer 2019](https://jov.arvojournals.org/article.aspx?articleid=2755285) (2).
@@ -152,56 +187,126 @@ Narrowband normalization is the dot product between stimulus contrast energy and
 
 Narrowband normalization is stimulus specific but feature independent (2).
 
-## Options
-rho
-- None = no noise
-- 0    = no noise correlation:w
-- !=0  = noise correlation
+### Model
+```python
+model=ama.Model(
+                 modelType='gss'      # main algorithm
+                 responseType='basic' # how responses are read
+        )
+```
+
+modelType - how likelihoods are computed.
+- 'gss'  = AMA-gauss assumes that class-conditional distributions are normally distributed (see [Jaini & Burge 2017](https://jov.arvojournals.org/article.aspx?articleid=2659576))
+- 'full' = the original, full AMA model
 
 responseType
 - 'mean' = likelihoods based on mean responses
 - 'basic' = likelihoods based on noisey responses
 
-normalizationType:
-- 'None'
-- 'broadband'
-- 'narrowband'
-see 'Normalization' above
+### Objective
+```python
+objective=ama.Objective(errType='map',
+                        lossType='mean'
+)
+```
+
+errType  - 
+lossType - 
+
+### Optimizer
+```python
+optimizer=a.Optimizer(
+                      optimizerType='adam',         # optax algorithm
+                      projectionType=['l2_ball',1], # constrained optimization
+                      lRate0=1e-1,                  # initial learning rate
+                      nIterMax=200,                 # max number of iterations
+                          f0_jxrand_fun=['ball',1]  # how to generate initial filters
+)  
+```
+
+lRate0 - initial learning default
+
+optimizerType - optax optimzation algorithm.
+ama.py uses optax for optimization.  The list of supported optimizers are listed in the [optax documentation](https://optax.readthedocs.io/en/latest/api/optimizers.html).
+
+
+projectionType - optax projeciton type
+Constrained optimization is a requirement for ama to work properly.
+Otherwise filters magnitude will continue to grow infinitely.
+AMA.py uses projections to perform constrained optimizations, and is able to use
+any projection specified in [optax documentation](https://optax.readthedocs.io/en/latest/api/projections.html).
+Note also that AMA.py also applies the specified constraint to each filter.
+When learning in the spatial domain, L2 constraints `L1_ball` or ` L1_sphere` is recommended.
+When learning in the fourier domain, a sparsity constraint is  `l1_ball` or ` l1_sphere` is recommended.
+`['l2_ball',1]` specifies optax `projection_l2_ball(_,1)`, where `1` is the scale paremter.
+
+`['box',-1, 1]` specifies optax `projection_box(_,-1,1)`, where `-1` and `1` are the `lower` and `upper` parameters.
+
+f0_jxrand_fun - jax.random function to generate initial filters
+This simply specifies the distribution from which to pull initial filter values from.
+These can be any of the random samplers specified in `jax.random` [jax documentation](https://jax.readthedocs.io/en/latest/jax.random.html#random-samplers).
+These are specified by `f0_jx_rand_fun` in the same way as constraints above,
+e.g. `['ball',1]` for `ball(_,1)` where `1` specified the dimension parameter `d`.
+
+
+### Learning parameters
+```python
+unit.train_new(
+          3,                      # number of filters
+          fourierType=0,          # whether to learn filters in fourier domain
+          bSplit,                 # whether to split filters (and stimuil into multiple parts
+          dtype=float32,          # data type of filters and stimuli
+          optimizer=optimzer
+)
+```
+bSplit - whether to split filters into subfilters
+Stereo/binocular data a single natural split (`nSplit=1`) between each stereo-half.
+When learning filters for stereo images, one can treat each stereo-half as its
+own sub-filter. This can be a more efficient way to learn filters, as it
+effectively allows sub-filters to be 'reused' in context with other filters.
+
+In order to use this splitting feature, the number of splits must be specified
+in `Stim` by `nSplit` and `bSplit=True` set in `Unit.`
+
 
 fourierType
 - 0 = learning in spatio/temporal domain
 - 1 = learning in fourier domain
 - 2 = learns quadradrature pair in fourier domain
 
-modelTypes
-- 'gss'
-- 'full' (coming soon)
+dtype - datatype of filters to be learned
+- float32   - default and recommended for non-fourier-domain learning
+- float64
+- float128
+- complex64 - default and only sane choice for fourier-domain learning 
 
-## Data
-Binocular data from [White & Burge 2024](https://www.biorxiv.org/content/10.1101/2024.02.27.582383v3.full)
-- TODO full
-- TODO flattened
-
-Motion-in-depth data from [dheerrera1911/3D-motion_ideal_observer](https://github.com/dherrera1911/3D_motion_ideal_observer)
-- [OSF repository](https://osf.io/w9mpe/)
-
-Disparity and speed data from [burgelab/AMA](https://github.com/burgelab/AMA)
-- [AMAdataDisparity.mat](https://github.com/burgelab/AMA/raw/refs/heads/master/AMAdataDisparity.mat)
-- [AMAdataSpeed.mat](https://github.com/burgelab/AMA/raw/refs/heads/master/AMAdataSpeed.mat)
+optimizer = ama.optimizer instance.
 
 ## Other AMA implementations
+
 [burgelab/AMA](https://github.com/burgelab/AMA) - the original matlab implementation
 
 [dherrera/amatorch](https://github.com/dherrera1911/amatorch) - written in python with pytorch, features learning based on noise-covariance
 
+[portalgun/AMA.DNW.mat](https://github.com/portalgun?tab=repositories) - matlab prototype for ama.py
+
 ## TODO
+- better rmax default?
 - finish split
-- full ama
-- fourier learning
-- t-sne
+- finish fourier learning
+- finish full ama
+- t-sne response learning
 - option for splitting quadrature pairs
 - phase parameter for quadrature pair learning
-- fmincon like options
+- other parameter based learning?
+- fmincon-like options
+- jupyter notebooks
+
+Redundant?
+- rho = None
+- responseType = mean
+- bNoise = False
+
 
 # Citations
 (1) Burge J, Jaini P (2017). Accuracy Maximization Analysis for sensory-perceptual tasks: Computational improvements, filter robustness, and coding advantages for scaled additive noise.  PLoS Computational
