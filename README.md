@@ -4,7 +4,7 @@ Accuracy Maximization Analysis (AMA) in python with JAX and Optax
 AMA is a supervised learning algorithm that learns image-filters that best encode features for a given task, given the constraints of the visual system.
 See [Burge and Jaini 2017](https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1005281) (1).
 
-NOTE: this is under-development. Most features listed below have been implemented, those that have not are listed under 'TODO'
+NOTE: this is under-development. Most features listed below have been implemented, those that have not are mentioned in 'TODO'
 
 
 ## Ratinonale
@@ -16,8 +16,7 @@ This implementation aims to make AMA as fast as possible through JAX. JAX provid
 - auto-vectorization 
 
 This implementation is also able to gain some performance increases by optionally learning in the fourier domain with/without learning Quadrature/Hilbert filter pairs.
-Learning filters in fourier domain allows one to take advantage of a sparsity constraint.
-Learning Quadrature/Hilbert pairs effectively learns two filters simultaneously with 1/4th the number of parameters.
+Learning filters in fourier domain allows one to take advantage of a sparsity constraint, and learning Quadrature/Hilbert pairs effectively learns two filters simultaneously with 1/4th the number of parameters.
 These features also allow efficient computation of narrow-band normalization---a feature exclusive to this implementation.
 
 For binocular images, additional performance can be gained by the "splitting" feature which splits the filter into two sub-filters.
@@ -119,6 +118,15 @@ unit.plot_spinner()
 
 ```
 ## End-User Classes and Options
+The main classes of objects are
+- Stim
+- Nrn
+- Model
+- Objective
+- Unit
+  For most use-cases, all but Unit should be treated as containers for the various parameters.
+  Once they have been wrapped into a Unit, all learning and plotting routines are to be access through the Unit.
+
 ### Stim
 ```python
 stim=Stim(
@@ -181,14 +189,10 @@ rho - noise correlation
 
 normalizationType - type of response normalization to perform. A good explanation of these two types of normalization and how they differ can be found in [Burge & Iyer 2019](https://jov.arvojournals.org/article.aspx?articleid=2755285) (2).
 - 'None'
-- 'broadband' - Broadband normalization is simply the L2 norm of the stimulus contrast energy:
-<img src="https://latex.codecogs.com/svg.image?{\color{Gray}N_{brd}=||\mathbf&space;A_c||_2}" title="{\color{Gray} N_{brd}=||\mathbf A_c||_2}" />
-   Narrowband normalization is stimulus specific but feature dependent (2).
+- 'broadband' - Broadband normalization is simply the L2 norm of the stimulus contrast energy: <img src="https://latex.codecogs.com/svg.image?{\color{Gray}N_{brd}=||\mathbf&space;A_c||_2}" title="{\color{Gray} N_{brd}=||\mathbf A_c||_2}" />.
 
-- 'narrowband' - Narrowband normalization is the dot product between stimulus contrast energy and filter contrast energy:
-<img src="https://latex.codecogs.com/svg.image?{\color{Gray}N_{nrw}=\mathbf&space;A_c^\intercal\mathbf&space;A_f&space;}" title="{\color{Gray} N_{nrw}=\mathbf A_c^\intercal\mathbf A_f}" />
+- 'narrowband' - Narrowband normalization is the dot product between stimulus contrast energy and filter contrast energy: <img src="https://latex.codecogs.com/svg.image?{\color{Gray}N_{nrw}=\mathbf&space;A_c^\intercal\mathbf&space;A_f&space;}" title="{\color{Gray} N_{nrw}=\mathbf A_c^\intercal\mathbf A_f}" />.
    Narrowband normalization is stimulus specific but feature independent (2).
-narrowband 
 
 ### Model
 The likelihood model: determines likelihoods of response data, given the parameters
@@ -215,28 +219,28 @@ objective=ama.Objective(errType='map',
                         lossType='mean',
 )
 ```
-The objective function is composed as `loss(error(estimation(posterior(likelihood))` when using a posterior or
+  * [ ] The objective function is composed as `loss(error(estimation(posterior(likelihood))` when using a posterior or
 `loss(error(estimation(likelihood)` otherwise
 
 bPosterior - whether to estimate based on posterior instead of the likelihood.
 
 estType - how to estimate 
-    - None = for map and mle errTypes TODO
-    - 'median' = TODO rename interp?
-    - 'mean'   = TODO rename
-    - 'mode'   = TODO rename
+- None = for map and mle errTypes TODO
+- 'median' = TODO rename interp?
+- 'mean'   = TODO rename
+- 'mode'   = TODO rename
 
 errType  -  how errors are computed/weighted
-    - 'mle' = maximimum likelihood  log(Likelihood at correct) TODO
-    - 'map' = maximum a posteriori -log(Posterior at correct) TODO
-    - 'l1'  = L1 deviation TODO
-    - 'l2'  = L2 deviation TODO
+- 'mle' = maximimum likelihood  log(Likelihood at correct) TODO
+- 'map' = maximum a posteriori -log(Posterior at correct) TODO
+- 'l1'  = L1 deviation TODO
+- 'l2'  = L2 deviation TODO
 
 lossType - how to transform individual errors into a scalar loss value
-    - 'mean' = e.g. mean with `errType=l2` is MSE
-    - 'median'
-    - 'mode'
-    - 'cmean' = circular mean
+- 'mean' = e.g. mean with `errType=l2` is MSE
+- 'median'
+- 'mode'
+- 'cmean' = circular mean
     
 ### Optimizer
 ```python
@@ -278,25 +282,25 @@ Container for all the various parts and interface for the end-user.
 unit=ama.Unit(stim,nrn,model,objective)
 ```
 
-### Learning parameters
+#### Learning methods 
 ```python
-unit.train_new(
-          3,                      # number of filters
-          fourierType=0,          # whether to learn filters in fourier domain
-          bSplit,                 # whether to split filters (and stimuil into multiple parts
-          dtype=float32,          # data type of filters and stimuli
-          optimizer=optimzer
-)
+unit.train_new(n,...)
 ```
-bSplit - whether to split filters into subfilters
-Stereo/binocular data a single natural split (`nSplit=1`) between each stereo-half.
-When learning filters for stereo images, one can treat each stereo-half as its
-own sub-filter. This can be a more efficient way to learn filters, as it
-effectively allows sub-filters to be 'reused' in context with other filters.
+Discard current filters (if any) and learn `n` new filters.
 
-In order to use this splitting feature, the number of splits must be specified
-in `Stim` by `nSplit` and `bSplit=True` set in `Unit.`
+``` python
+unit.train_append(n,...)
+```
+Learn `n` new filters while fixing the others in place. 
 
+``` python
+unit.train_recurse(...)
+```
+Continue iterating over current filters.
+
+
+#### Learning parameters
+All learning methods optionally contain the following parameters:
 
 fourierType
 - 0 = learning in spatio/temporal domain
@@ -311,14 +315,41 @@ dtype - datatype of filters to be learned
 
 optimizer = ama.optimizer instance.
 
-### Notes on hacking
+bSplit - whether to split filters into sub-filters
+Stereo/binocular data a single natural split (`nSplit=1`) between each stereo-half.
+When learning filters for stereo images, one can treat each stereo-half as its
+own sub-filter. This can be a more efficient way to learn filters, as it
+effectively allows sub-filters to be 'reused' in context with other filters.
+In order to use this splitting feature, the number of splits must be specified
+in `Stim` by `nSplit` and `bSplit=True` set in `Unit.`
+
+#### properties
+- out
+- last
+
+- loss
+- response
+- error
+
+#### Plotting
+```python
+unit.plot_out()
+```
+
+```python
+unit.plot_joint_responses()
+```
+
+```python
+unit.plot_joint_responses_tsne() 
+```
+## Notes on hacking
 In order to aid with autograd, learning routines do not contain any 'if' statements.
 Instead, objective functions are composed dynamically before execution.
 The _TypeFunc descriptor parses and fetches functions as properties are set using meta programming.
 Together, these allow for fast optimization, parameter flexibility, and straightforward extensibility, but at the cost of readable code. 
 
 ## Other AMA implementations
-
 [burgelab/AMA](https://github.com/burgelab/AMA) - the original matlab implementation
 
 [dherrera/amatorch](https://github.com/dherrera1911/amatorch) - written in python with pytorch, features learning based on noise-covariance
@@ -333,9 +364,15 @@ Together, these allow for fast optimization, parameter flexibility, and straight
 - phase parameter for quadrature pair learning
 - fmincon-like options
 - binocular data
+
 - test setup
 - test cases
 - move to src
+
+- weights and combination learning (no likelihoods?)
+ 
+- unit clear
+- unit save
 
 jupyter notebooks
 - different data
@@ -350,7 +387,7 @@ Redundant?
 - bNoise = False
 
 
-# Citations
+# Works cited
 (1) Burge J, Jaini P (2017). Accuracy Maximization Analysis for sensory-perceptual tasks: Computational improvements, filter robustness, and coding advantages for scaled additive noise.  PLoS Computational
 
    Biology, 13(2): e1005281. doi:10.1371/journal.pcbi.1005281
@@ -360,3 +397,4 @@ Redundant?
 (3) DN White, J Burge. How distinct sources of nuisance variability in natural images and scenes limit human stereopsis. Preprint. (582383). https://doi.org/10.1101/2024.02.27.582383
 
 (4) Jaini P, Burge J (2017). Linking normative models of natural tasks with descriptive models of neural response. Journal of Vision, 17(12):16, 1-26
+    
