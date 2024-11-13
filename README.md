@@ -118,8 +118,7 @@ unit.plot_out()
 unit.plot_spinner()
 
 ```
-
-## Classes and Options
+## End-User Classes and Options
 ### Stim
 ```python
 stim=Stim(
@@ -133,7 +132,7 @@ stim=Stim(
 )
 ```
 
-x - meshgird for stimulus, used for plotting
+x - meshgird for stimulus, used for plotting TODO
 
 stimuli - data
 
@@ -148,6 +147,21 @@ nSplit - number of natural splits data has
 bStimIsSplit - whether stimuli is already split
 
 ### Nrn
+The neural response model
+```python
+nrn=ama.Nrn(
+             fano=1.36,              # fano factor
+             var0=0.23,              # base noise variance
+             rmax=5.7                # max response,
+             normalizeType='None',   # type of normalization
+             eps=0.001               # normalization epsilon
+             bRectify=False,         # whether to recify responses
+             bNoise=False,           # whether to use noise
+             rho=0,                  # noise correlation
+)
+```
+
+
 fano - fano factor. `1.36` default
 
 var0 - base noise variance. `0.23` default
@@ -165,29 +179,19 @@ rho - noise correlation
 - 0    = no noise correlation:w
 - !=0  = noise correlation
 
-normalizationType - type of response normalization to perform (see 'Normalization' above)
+normalizationType - type of response normalization to perform. A good explanation of these two types of normalization and how they differ can be found in [Burge & Iyer 2019](https://jov.arvojournals.org/article.aspx?articleid=2755285) (2).
 - 'None'
-- 'broadband'
-- [ ] 'narrowband'
-ama.py currently supports two forms of neural response normalization---broadband <img src="https://latex.codecogs.com/svg.image?{\color{Gray}N_{brd}}" title="{\color{Gray} N_{brd}}" />
-narrowband <img src="https://latex.codecogs.com/svg.image?{\color{Gray}N_{brd}}" title="{\color{Gray} N_{nrw}}" />.
-A good explanation of these two types of normalization and how they differ can be found in [Burge & Iyer 2019](https://jov.arvojournals.org/article.aspx?articleid=2755285) (2).
-
-### Broadband
-Broadband normalization is simply the L2 norm of the stimulus contrast energy:
-
+- 'broadband' - Broadband normalization is simply the L2 norm of the stimulus contrast energy:
 <img src="https://latex.codecogs.com/svg.image?{\color{Gray}N_{brd}=||\mathbf&space;A_c||_2}" title="{\color{Gray} N_{brd}=||\mathbf A_c||_2}" />
+   Narrowband normalization is stimulus specific but feature dependent (2).
 
-Broadband normalization is stimulus specific but feature independent (2).
-
-### Narrowband
-Narrowband normalization is the dot product between stimulus contrast energy and filter contrast energy:
-
+- 'narrowband' - Narrowband normalization is the dot product between stimulus contrast energy and filter contrast energy:
 <img src="https://latex.codecogs.com/svg.image?{\color{Gray}N_{nrw}=\mathbf&space;A_c^\intercal\mathbf&space;A_f&space;}" title="{\color{Gray} N_{nrw}=\mathbf A_c^\intercal\mathbf A_f}" />
-
-Narrowband normalization is stimulus specific but feature independent (2).
+   Narrowband normalization is stimulus specific but feature independent (2).
+narrowband 
 
 ### Model
+The likelihood model: determines likelihoods of response data, given the parameters
 ```python
 model=ama.Model(
                  modelType='gss'      # main algorithm
@@ -195,7 +199,8 @@ model=ama.Model(
         )
 ```
 
-modelType - how likelihoods are computed.
+
+modelType - algorithm for likelihoods are computed.
 - 'gss'  = AMA-gauss assumes that class-conditional distributions are normally distributed (see [Jaini & Burge 2017](https://jov.arvojournals.org/article.aspx?articleid=2659576))
 - 'full' = the original, full AMA model
 
@@ -204,15 +209,35 @@ responseType
 - 'basic' = likelihoods based on noisey responses
 
 ### Objective
+The objective function for optimization
 ```python
 objective=ama.Objective(errType='map',
-                        lossType='mean'
+                        lossType='mean',
 )
 ```
+The objective function is composed as `loss(error(estimation(posterior(likelihood))` when using a posterior or
+`loss(error(estimation(likelihood)` otherwise
 
-errType  - 
-lossType - 
+bPosterior - whether to estimate based on posterior instead of the likelihood.
 
+estType - how to estimate 
+    - None = for map and mle errTypes TODO
+    - 'median' = TODO rename interp?
+    - 'mean'   = TODO rename
+    - 'mode'   = TODO rename
+
+errType  -  how errors are computed/weighted
+    - 'mle' = maximimum likelihood  log(Likelihood at correct) TODO
+    - 'map' = maximum a posteriori -log(Posterior at correct) TODO
+    - 'l1'  = L1 deviation TODO
+    - 'l2'  = L2 deviation TODO
+
+lossType - how to transform individual errors into a scalar loss value
+    - 'mean' = e.g. mean with `errType=l2` is MSE
+    - 'median'
+    - 'mode'
+    - 'cmean' = circular mean
+    
 ### Optimizer
 ```python
 optimizer=a.Optimizer(
@@ -220,7 +245,7 @@ optimizer=a.Optimizer(
                       projectionType=['l2_ball',1], # constrained optimization
                       lRate0=1e-1,                  # initial learning rate
                       nIterMax=200,                 # max number of iterations
-                          f0_jxrand_fun=['ball',1]  # how to generate initial filters
+                      f0_jxrand_fun=['ball',1]      # how to generate initial filters
 )  
 ```
 
@@ -239,7 +264,6 @@ Note also that AMA.py also applies the specified constraint to each filter.
 When learning in the spatial domain, L2 constraints `L1_ball` or ` L1_sphere` is recommended.
 When learning in the fourier domain, a sparsity constraint is  `l1_ball` or ` l1_sphere` is recommended.
 `['l2_ball',1]` specifies optax `projection_l2_ball(_,1)`, where `1` is the scale paremter.
-
 `['box',-1, 1]` specifies optax `projection_box(_,-1,1)`, where `-1` and `1` are the `lower` and `upper` parameters.
 
 f0_jxrand_fun - jax.random function to generate initial filters
@@ -248,6 +272,11 @@ These can be any of the random samplers specified in `jax.random` [jax documenta
 These are specified by `f0_jx_rand_fun` in the same way as constraints above,
 e.g. `['ball',1]` for `ball(_,1)` where `1` specified the dimension parameter `d`.
 
+### Unit
+Container for all the various parts and interface for the end-user.
+```python
+unit=ama.Unit(stim,nrn,model,objective)
+```
 
 ### Learning parameters
 ```python
@@ -282,6 +311,12 @@ dtype - datatype of filters to be learned
 
 optimizer = ama.optimizer instance.
 
+### Notes on hacking
+In order to aid with autograd, learning routines do not contain any 'if' statements.
+Instead, objective functions are composed dynamically before execution.
+The _TypeFunc descriptor parses and fetches functions as properties are set using meta programming.
+Together, these allow for fast optimization, parameter flexibility, and straightforward extensibility, but at the cost of readable code. 
+
 ## Other AMA implementations
 
 [burgelab/AMA](https://github.com/burgelab/AMA) - the original matlab implementation
@@ -291,16 +326,23 @@ optimizer = ama.optimizer instance.
 [portalgun/AMA.DNW.mat](https://github.com/portalgun?tab=repositories) - matlab prototype for ama.py
 
 ## TODO
-- better rmax default?
 - finish split
 - finish fourier learning
 - finish full ama
-- t-sne response learning
-- option for splitting quadrature pairs
+- t-sne response plotting 
 - phase parameter for quadrature pair learning
-- other parameter based learning?
 - fmincon-like options
-- jupyter notebooks
+- binocular data
+- test setup
+- test cases
+- move to src
+
+jupyter notebooks
+- different data
+
+- better rmax default? ~60?
+- merge Objective and Model?
+- other parameter based learning?
 
 Redundant?
 - rho = None
