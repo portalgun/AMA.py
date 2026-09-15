@@ -1,14 +1,18 @@
-#: f                         [ nPix x nF ]                       (nPix / nSplit) x nSplit x nF
-#: stim [ nPix  x nStim ] -> [ nPix  x nStim_Ctg x nCtg ]        (nPix / nSplit) x nSplit x nStim_Ctg x nCtg
-#: R    [ nF    x nStim ] -> [ nF    x nStim_Ctg x nCtg]
-#: lAll [ nStim x nCtg ]  -> [ nStim x nCtg x nCtg]
-#: pCor [ nStim x 1 ]
-#: yHat [ nStim x 1 ]
-#: iters
-#:      appendages (new filters)
-#:      recursions                 - learn
-#:          batch
-#:      minimize                   - iter
+"""
+f                         [ nPix x nF ]                       [(nPix / nSplit) x nSplit x nF]
+stim [ nPix  x nStim ] -> [ nPix  x nStim_Ctg x nCtg ]        [(nPix / nSplit) x nSplit x nStim_Ctg x nCtg]
+R    [ nF    x nStim ] -> [ nF    x nStim_Ctg x nCtg]         [ nF x nSplit x nStim_Ctg x nCtg ]
+lAll [ nStim x nCtg ]  -> [ nStim x nCtg x nCtg]
+pCor [ nStim x 1 ]
+yHat [ nStim x 1 ]
+iters
+     appendages (new filters)
+     recursions                 - learn
+         batch
+     minimize                   - iter
+
+        #:
+"""
 
 
 import copy
@@ -18,6 +22,7 @@ import jax.random as jxrandom
 import numpy.random as random
 from jax import grad,jit,vmap,lax,value_and_grad,tree_util,profiler
 from jax.scipy.stats import multivariate_normal as mvn
+from jax.scipy.stats import mode
 import statsmodels.stats.moment_helpers as mh
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
@@ -27,10 +32,15 @@ import Filter as filt
 from jax._src.numpy.util import promote_dtypes_inexact
 from dataclasses import dataclass
 from scipy.io import loadmat
-from itertools import combinations
+from itertools import combinations, product
+from sklearn.manifold import TSNE 
 
 #log_dir = "logs/fit/" + time.strftime("%Y%m%d-%H%M%S")
 #writer = tf.summary.create_file_writer(log_dir)
+
+@jit
+def _combine(r):
+    return jnp.concat(r.imag,r.real,axis=0)
 
 
 def _get_copy_dict(instance,excl=[]):
@@ -60,7 +70,21 @@ def lmvn0(x0,cov):
             partial(lax.linalg.triangular_solve, lower=True, transpose_a=True),
             signature="(n,n),(n)->(n)"
         )(L, x0)
-    return (-1/2 * jnp.einsum('...i,...i->...', y, y) - cov.shape[-1]/2 * jnp.log(2*np.pi)
+    return (-1/2 * jnp.einsum('...i,...i->...', y, y)
+            - cov.shape[-1]/2 * jnp.log(2*np.pi)
+            - jnp.log(L.diagonal(axis1=-1, axis2=-2)).sum(-1))
+
+@jit
+def lmvn0_split(x0,cov):
+    x0, cov = promote_dtypes_inexact(x0,cov)
+    L = lax.linalg.cholesky(cov)
+    y = jnp.vectorize(
+            partial(lax.linalg.triangular_solve, lower=True, transpose_a=True),
+            signature="(n,n),(n)->(n)"
+        )(L, x0)
+    # XXX
+    return (-1/2 * jnp.einsum('...i,...i->...', y, y)
+            - cov.shape[-1]/2 * jnp.log(2*np.pi)
             - jnp.log(L.diagonal(axis1=-1, axis2=-2)).sum(-1))
 
 class _ParentProp:
@@ -155,7 +179,7 @@ class _TypeFunc():
 
     @property
     def func_name(self):
-        return '_' + self._base_func_name + '__' + self._inst_func_name
+        return '_' + self._base_func_name.split('_')[0] + '__' + self._inst_func_name
 
 
     @property
@@ -181,13 +205,22 @@ class _TypeFunc():
 
 class Stim:
     def index(self,index=(0,0)):
+        """
+        stim [ nPix  x nStim ] -> [ nPix  x nStim_Ctg x nCtg ]        [(nPix / nSplit) x nSplit x nStim_Ctg x nCtg]
+        """
         return jnp.reshape(self.val[:,index[0],index[1]],self.dims)
 
     def __getitem__(self,index):
         yCtgInd=self.yCtgInd[index].flatten(order='F')
-        return Stim(self.x,self.val[...,index[0],index[1]],yCtgInd, self.Y, self.bIsFourier, _bShape=True, _weights=self.weights[index],_yCtg=self.yCtg[index])
+        return Stim(self.x,self.val[...,index[0],index[1]],yCtgInd, self.Y, self.bIsFourier,
+                    nSplit=self.nSplit,
+                    bStimIsSplit=self.bIsSplit,
+                    _bShape=True,
+                    _weights=self.weights[index],
+                    _yCtg=self.yCtg[index]
+        )
 
-    def __init__(self,x,stimuli,yCtgInd,Y,bStimIsFourier=False,_bShape=False,_weights=np.empty,_yCtg=np.empty,nSplit=0,bStimIsSplit=False):
+    def __init__(self,x,stimuli,yCtgInd,Y,bStimIsFourier=False,nSplit=0,bStimIsSplit=False,_bShape=False,_weights=np.empty,_yCtg=np.empty):
 
         self.bIsFourier=bStimIsFourier
 
@@ -250,7 +283,7 @@ class Stim:
         self.val=filt.ifft(self.x,self.val)
         self.bIsFourier=False
 
-    def finalize(self,dtype,index,bFourier,bSplit):
+    def _finalize(self,dtype,index,bFourier,bSplit):
         if bSplit and not self.bIsSplit:
             self.split()
         elif not bSplit and  self.bIsSplit:
@@ -271,10 +304,12 @@ class Stim:
             return self.index(index)
         else:
             return self
+
     def split(self):
         #[ nPix  x nStim_Ctg x nCtg ]    (nPix / nSplit) x nSplit x nStim_Ctg x nCtg
         # check shape
         self.val=jnp.reshape(self.val,(self.nPix/self.nSplit, self.nSplit, self.nStim_Ctg, self.nCtg))
+
         self.bIsSplit=True
 
         return
@@ -296,14 +331,26 @@ class Stim:
         else:
             stim=self.index(index)
 
-        if self.ndim==1:
-            filt.plotFT(self.x.sl[0],stim)
-        elif self.ndim==2:
-            plt.imshow(self.index(index),extent=self.x.extents)
-        elif self.ndim==3:
-            raise Exception('TODO')
-        elif self.ndim==4:
-            raise Exception('TODO')
+        if self.bIsSplit:
+            n=range(self.nSplit)
+        else:
+            n=(1,)
+
+        for i in n:
+            if self.bIsSplit:
+                s=stim[...,i]
+                plt.subplot(1,self.nSplit,i)
+            else:
+                s=stim
+
+            if self.ndim==1:
+                filt.plotFT(self.x.sl[0],s)
+            elif self.ndim==2:
+                plt.imshow(s,extent=self.x.extents)
+            elif self.ndim==3:
+                raise Exception('TODO')
+            elif self.ndim==4:
+                raise Exception('TODO')
 
     @staticmethod
     def load(fname):
@@ -423,8 +470,7 @@ class Filter():
         self.last=None
         self.out=None
 
-    def finalize(self,stim,dtype,n,ind_lrn,ind_fix,ind_rec=(),bAnalytic=True,last=None,bSplit=False):
-        # XXX bSplit
+    def _finalize(self,stim,dtype,n,ind_lrn,ind_fix,ind_rec=(),bAnalytic=True,last=None,bSplit=False):
         #[ nPix x nF ]                   (nPix / nSplit) x nSplit x nF
 
         self.x=stim.x
@@ -446,7 +492,6 @@ class Filter():
 
         if last is not None:
             self.last=last
-
 
         self.bNew=self.last is None or len(self.last)==0
 
@@ -512,6 +557,9 @@ class Filter():
     def plot_out(self,bFourier=None,name='f_out'):
         self._plot(self.out,clim=(-1,1),bFourier=bFourier,name=name)
 
+    def plot_out(self,bFourier=None,name='f_last'):
+        self._plot(self.last,clim=(-1,1),bFourier=bFourier,name=name)
+
     def plot_fprepped(self,bFourier=None):
         self._plot(self.prepped_jx,clim=(0,1),bFourier=bFourier)
 
@@ -572,17 +620,19 @@ class Filter():
 
 
 class Nrn():
-    _noise_fun=_id
+    _noise_1_fun=_id
+    _noise_2_fun=_id
     _normalize_fun=_id
-    _rectify_fun=_id
+    _activation_fun=_id
     _corr_fun=_id
-    _combine_fun=id
-    bNoise=_TypeFunc(True)
-    bRectify=_TypeFunc(True)
+    _average_fun=_id
+    bNoise_1=_TypeFunc(True)
+    bNoise_2=_TypeFunc(True)
+    activationType=_TypeFunc()
     normalizeType=_TypeFunc()
     corrType=_TypeFunc()
-    bCombine=_TypeFunc(True)
-    def __init__(self,fano=1.36,var0=0.23,rmax=5.7,normalizeType='None',bRectify=False,bNoise=False,rho=0,eps=0.001):
+    averageType=_TypeFunc()
+    def __init__(self,fano=1.36,var0=0.23,rmax=57,normalizeType='None',activationType='tanh',bNoise_1=False,bNoise_2=False,rho=0,eps=0.001,averageType='full',nSamples=1):
         # TODO GET better rMax value
         # TODO check eps value
         self.fano=fano
@@ -590,9 +640,12 @@ class Nrn():
         self.rmax=rmax
         self.eps=eps
 
-        self.bNoise=bNoise
+        self.bNoise_1=bNoise_1
+        self.bNoise_2=bNoise_2
         self.normalizeType=normalizeType
-        self.bRectify=bRectify
+        self.activationType=activationType
+        self.averageType=averageType
+        self.nSamples=nSamples
 
         self.rho=rho
         if self.rho is None or ( isinstance(self.rho,str) and self.rho == 'None' ):
@@ -605,23 +658,6 @@ class Nrn():
         self.filter=Filter()
         self.bFinalized=False
 
-    def copy(self):
-       return Nrn(**_get_copy_dict(self,['filter','corrType','bAnalytic','bFinalized','bCombine','bSplit','bFourier']))
-
-    def finalize(self,stim,dtype,n,ind_lrn,ind_fix,ind_rec,bFourier=False,bAnalytic=False,bSplit=False,last=None):
-        self.dtype=dtype
-        self.bFourier=bFourier
-        self.bCombine=bFourier
-        self.bSplit=bSplit
-
-        self.filter.finalize(stim,dtype,n,ind_lrn,ind_fix,ind_rec,bAnalytic=bAnalytic,last=last,bSplit=bSplit)
-
-        n=self.filter.n
-        self._covMat_upper_index=jnp.array(jnp.triu(jnp.ones((n,n)), 1),dtype=bool)
-        self._covMat_lower_index=jnp.array(jnp.tril(jnp.ones((n,n)),-1),dtype=bool)
-
-        self.bFinalized=True
-
     @property
     def bAnalytic(self):
         if hasattr(self,'filter') and hasattr(self.filter,'index') and hasattr(self.filter.index,'bAnalytic'):
@@ -629,11 +665,21 @@ class Nrn():
         else:
             return None
 
+    def copy(self):
+       return Nrn(**_get_copy_dict(self,['filter','corrType','bAnalytic','bFinalized','bCombine','bSplit','bFourier']))
 
-    @staticmethod
-    @partial(jit, static_argnames=['rmax'])
-    def respond(f,stim,rmax):
-        return rmax*jnp.einsum('ij,ikl->jkl',jnp.conjugate(f),stim)
+    def _finalize(self,stim,dtype,n,ind_lrn,ind_fix,ind_rec,bFourier=False,bAnalytic=False,bSplit=False,last=None):
+        self.dtype=dtype
+        self.bFourier=bFourier
+        self.bSplit=bSplit
+
+        self.filter._finalize(stim,dtype,n,ind_lrn,ind_fix,ind_rec,bAnalytic=bAnalytic,last=last,bSplit=bSplit)
+
+        n=self.filter.n
+        self._covMat_upper_index=jnp.array(jnp.triu(jnp.ones((n,n)), 1),dtype=bool)
+        self._covMat_lower_index=jnp.array(jnp.tril(jnp.ones((n,n)),-1),dtype=bool)
+
+        self.bFinalized=True
 
     @staticmethod
     @jit
@@ -641,91 +687,124 @@ class Nrn():
         return f_prepped.at[index].set(fIn)
 
     @partial(jit, static_argnames=['self'])
-    def lrn_main(self,rng_key,stim,fIn):
+    def lrn_main(self,rng,stim,fIn):
 
-        return self.main(rng_key,stim,self.insert(fIn,self.filter.prepped_jx,self.filter._insert_index_jx))
+        return self.main(rng,stim,self.insert(fIn,self.filter.prepped_jx,self.filter._insert_index_jx))
 
     @partial(jit, static_argnames=['self'])
-    def main(self,rng_key,stim,f):
+    def main(self,rng,stim,f):
+        [rng,rng_key1] = jxrandom.split(rng)
+        [_,  rng_key2] = jxrandom.split(rng)
 
-        rm   = self._rectify_fun(self._combine_fun(self.respond(f,stim,self.rmax)))
+        # respond
+        r=self._activation_fun(self.respond(f,stim,self.rmax,self.bSplit),self.bFourier)
 
-        Rm   = self._normalize_fun(rm,stim,f,self.eps)
+        # noisey output 1
+        rNs,rNsVar = self._noise_1_fun(r,self.fano,self.var0,rng_key1,self.bFourier)
 
-        # XXX  rm or Rm?
-        nsVar = self._get_noise_var(self.fano,self.var0,rm)
-        covMat=self._corr_fun(nsVar,jnp.ones_like(f,shape=f.shape[-1]),self.rho)
+        # normalize
+        R      = self._normalize_fun(rNs,f,stim,self.rmax,self.eps,self.bSplit)
 
-        return self._noise_fun(Rm,rng_key,nsVar), Rm, covMat, nsVar
+        # noisey output 2
+        RNs,RNsVar = self._noise_2_fun(R,self.fano,self.var0,rng_key2,self.bFourier)
 
-    #- split
+        RCovMat=self._corr_fun(RNsVar,self.rho,self.bFourier)
+
+        return r,rNs, self._average_fun(R,RNs,self.bFourier),RNs,rNsVar,RNsVar,RCovMat
+
+    # respond
     @staticmethod
-    @jit
-    def _split__none(r):
-        return r
-
-    #- split
-    @jit
-    def _split__true(self,f,stim):
-        # stim [ nPix  x nStim_Ctg x nCtg ]
-        # [ nPix x nF ]
-
-        out=jnp.zeros_like(f,shape=(stim.shape[0],stim.shpae[1],f.shape[1]*self.nSplit))
-        for i in range(self.nSplit):
-            inds=self.allInds[:,i]
-            out[:,:,i]=stim[inds,:]*f[inds,:]
-        # XXX
-        return r
-
-    #- combine
-    @staticmethod
-    @jit
-    def _combine__none(r):
-        return r
-
-    @staticmethod
-    @jit
-    def _combine__true(r):
-        return jnp.concat(r.imag,r.real,axis=0)
+    @partial(jit, static_argnames=['rmax','bSplit'])
+    def respond(f,stim,rmax,bSplit):
+        """
+        f                         [ nPix x nF ]                       [(nPix / nSplit) x nSplit x nF]
+        stim [ nPix  x nStim ] -> [ nPix  x nStim_Ctg x nCtg ]        [(nPix / nSplit) x nSplit x nStim_Ctg x nCtg]
+        R    [ nF    x nStim ] -> [ nF    x nStim_Ctg x nCtg]         [ nF x nSplit x nStim_Ctg x nCtg ]
+        """
+        if bSplit:
+            return rmax*jnp.einsum('psf,psnc->fsnc',jnp.conjugate(f),stim)
+        else:
+            return rmax*jnp.einsum('pf,pnc->fnc',jnp.conjugate(f),stim)
 
     #- recify
     @staticmethod
     @jit
-    def _rectify__none(R):
+    def _activation__none(R,*_):
         return R
 
     @staticmethod
-    @jit
-    def _rectify__true(R):
-        return R.at[R < 0].set(0)
-
-
-    #- max
-    # RM??
-    @staticmethod
-    @jit
-    def _max__none(Rn,*_):
-        return Rn
+    @partial(jit, static_argnames=['bComplex'])
+    def _activation__relu(R,bComplex):
+        if bComplex:
+            return jnp.max(R.real,0) + 1j*jnp.max(R.imag,0)
+        else:
+            return jnp.max(R,0)
 
     @staticmethod
-    @jit
-    def _max__1(Rn,r):
-        return Rn/jnp.max(Rn)*jnp.max(r)
+    @partial(jit, static_argnames=['bComplex'])
+    def _activation__softplus(R,bComplex):
+        if bComplex:
+            return jnp.log(1+jnp.exp(R.real)) + jnp.log(1+jnp.exp(R.imag))
+        else:
+            return jnp.log(1+jnp.exp(R))
+
 
     @staticmethod
-    @jit
-    def _max__2(Rn,*_):
-        return Rn/jnp.max(Rn)
+    @partial(jit, static_argnames=['bComplex'])
+    def _activation__abs(R,bComplex):
+        if bComplex:
+            return jnp.abs(R.real) + 1j*jnp.abs(R.imag)
+        else:
+            return jnp.abs(R)
 
     @staticmethod
-    @jit
-    def _max__3(Rn,*_):
-        ind=abs(Rn)>1;
-        Rn[ind]=1*jnp.sign(Rn[ind]);
-        return Rn
+    @partial(jit, static_argnames=['bComplex'])
+    def _activation_logistic(R,bComplex):
+        if bComplex:
+            return 1/(1+jnp.exp(R.real)) + 1j/(1+jnp.exp(R.imag))
+        else:
+            return 1/(1+jnp.exp(R))
+
+    @staticmethod
+    @partial(jit, static_argnames=['bComplex'])
+    def _activation_swish(R,bComplex):
+        if bComplex:
+            return R.real/(1+jnp.exp(R.real)) + 1j*R.imag/(1+jnp.exp(R.imag))
+        else:
+            return R/(1+jnp.exp(R))
+
+    @staticmethod
+    @partial(jit, static_argnames=['bComplex'])
+    def _activation_swish2(R,bComplex):
+        if bComplex:
+            return R.real*((1+np.tanh(R.real))/2) + 1j*R.imag*((1+np.tanh(R.imag))/2)
+        else:
+            return R*((1+np.tanh(R))/2)
 
 
+    @staticmethod
+    @partial(jit, static_argnames=['bComplex'])
+    def _activation_tanh(R,bComplex):
+        if bComplex:
+            return jnp.tanh(R.real) + 1j*jnp.tanh(R.imag)
+        else:
+            return jnp.tanh(R)
 
+    @staticmethod
+    @partial(jit, static_argnames=['bComplex'])
+    def _activation_gauss(R,bComplex):
+        if bComplex:
+            return jnp.exp(-R.real**2) + 1j*jnp.exp(-R.imag**2)
+        else:
+            return jnp.exp(-R**2)
+
+    @staticmethod
+    @partial(jit, static_argnames=['bComplex'])
+    def _activation_igauss(R,bComplex):
+        if bComplex:
+            return (1-jnp.exp(-R.real**2)) + 1j*(1-jnp.exp(-R.imag**2))
+        else:
+            return 1-jnp.exp(-R**2)
 
     #- normalize
     @staticmethod
@@ -734,39 +813,78 @@ class Nrn():
         return R
 
     @staticmethod
-    @jit
-    def _normalize__broad(R,stim,_,err):
+    @partial(jit, static_argnames=['rmax','eps','bSplit'])
+    def _normalize__gen(R,f,stim,rmax,eps,bSplit):
+        # TODO should bSplit be separate from self.bSplit?
+        if bSplit:
+            return R/(eps + jnp.sum(R,axis=(0,1),keepdims=True))
+        else:
+            return R/(eps + jnp.sum(R,axis=0,keepdims=True))
+
+    @staticmethod
+    @partial(jit, static_argnames=['rmax','eps','bSplit'])
+    def _normalize__broad(R,f,stim,rmax,eps,bSplit):
         # TODO VMAP
         for i in range(jnp.shape(R)[0]):
-            R=R.at[i,:].set(R.at[i,:]/(err+jnp.norm(stim.val[:,i])))
+            R=R.at[i,:].set(R.at[i,:]/(eps+rmax*jnp.norm(stim.val[:,i])))
 
         return R
 
     @staticmethod
-    @jit
-    def _normalize__narrow(R,stim,f,eps):
-        ## check this is the correct one
-        # TODO
-        # Rn=r./(S.As' * abs(obj.f));
-        return R/(eps + jnp.einsum('ij,ikl->jkl',jnp.abs(f),stim))
+    @partial(jit, static_argnames=['rmax','eps','bSplit'])
+    def _normalize__narrow(R,f,stim,rmax,eps,bSplit):
+        # TODO Rn=r./(S.As' * abs(obj.f));
+        if bSplit:
+            return R/(eps + rmax*jnp.einsum('psf,psnc->fsnc',jnp.abs(f),stim))
+        else
+            return R/(eps + rmax*jnp.einsum('pf,pnc->fnc',jnp.abs(f),stim))
+
     #- noise
     @staticmethod
-    @partial(jit, static_argnames=['fano','var0'])
-    def _get_noise_var(fano,var0,rm):
-        return fano * jnp.abs(rm) + var0
+    @jit
+    def _noise__none(R,*_):
+        return R,0
+
+    @staticmethod
+    @partial(jit, static_argnames=['fano','var0','n','bComplex'])
+    def _noise__true(R,fano,var0,n,rng_key,bComplex):
+        # TODO for specified covMat
+        #jrandom.multivariate_normal(rng_key, mean, cov, shape=None, dtype=None, method='cholesky')
+
+        if bComplex:
+            [rng_real,rng_imag] = jxrandom.split(rng_key)
+
+            var=fano * (jnp.abs(R.real) + 1j*jnp.abs(R.imag)) + var0 + 1j*var0
+            return R + (
+                    (   jxrandom.normal(rng_real,R.shape+(n,)) * jnp.sqrt(var.real))
+                  + (1j*jxrandom.normal(rng_imag,R.shape+(n,)) * jnp.sqrt(var.imag)) ), var
+        else:
+            var=fano * jnp.abs(R) + var0
+            return R +  (jxrandom.normal(rng_key,R.shape+(n,)) * jnp.sqrt(var)), var
+
+    #- noise averaging
+    @staticmethod
+    @jit
+    def _average__full(R,RNs,*_):
+        return R
 
     @staticmethod
     @jit
-    def _noise__true(Rm,rng_key,var):
-        [_,rng_key] = jxrandom.split(rng_key)
-        # XXX is this right? does the first out need to be returned?
+    def _average__mean(R,RNs,*_):
+        return jnp.mean(RNs,axis=-1)
 
-        return Rm +  (jxrandom.normal(rng_key,Rm.shape) * jnp.sqrt(var))
+    @staticmethod
+    @partial(jit, static_argnames=['bComplex'])
+    def _average__log_mean(R,RNs,bComplex):
+        if bComplex:
+            return jnp.sign(RNs.real)*jnp.exp(jnp.mean(jnp.log(jnp.abs(RNs.real)),axis=-1)) + jnp.sign(RNs.imag)*jnp.exp(jnp.mean(jnp.log(jnp.abs(RNs.imag)),axis=-1))
+        else:
+            return jnp.sign(RNs)*jnp.exp(jnp.mean(jnp.log(jnp.abs(RNs)),axis=-1))
 
     @staticmethod
     @jit
-    def _noise__none(Rm,*_):
-        return Rm
+    def _average__median(R,RNs,*_):
+        return jnp.median(R,RNs,axis=-1)
 
     #- corr
     @staticmethod
@@ -776,31 +894,34 @@ class Nrn():
 
     @staticmethod
     @jit
-    def _corr__uncorr(nsVar,covDiag0,*_):
-        # noise variance
-        # MATCH CONSTANT ADDITIVE TO AVERAGE SCALED ADDITIVE NOISE VARIANCE
-        # INTERNAL FILTER RESPONSE COVARIANCE MATRIX (ASSUMING UNCORRELATED NOISE)
+    def _corr__uncorr(nsVar,*_):
+        return jnp.diag(jnp.reshape(  jnp.mean(nsVar,(2,3)), -1))
 
-        return jnp.diag(jnp.mean(jnp.square(nsVar)) * covDiag0)
+    @staticmethod
+    @partial(jit, static_argnames=['rho','bComplex'])
+    def _corr__corr(nsVar,rho,bComplex):
+        if bComplex:
+            d=jnp.reshape(  jnp.mean(nsVar,(2,3)), -1)
+            sigma=jnp.sqrt(d.real) + 1j*jnp.sqrt(d.imag)
+        else:
+            sigma=jnp.sqrt(jnp.reshape(  jnp.mean(nsVar,(2,3)), -1))
 
-    # TODO pytree-ize
-    @partial(jit, static_argnames=['self','rho'])
-    def _corr__corr(self,nsVar,covDiag0,rho):
-        covMat=Nrn._corr__uncorr(nsVar,covDiag0)
-
-        C = mh.corr2cov(covMat,rho)
-        covMat[self._covMat_upper_index] = C
-        covMat[self._covMat_lower_index] = C
-        return covMat
-
+        n=sigma.shape[0]
+        corrMat=jnp.full((n,n),rho)
+        jnp.fill_diagonal(corrMat,1)
+        return jnp.outer(sigma,sigma)*corrMat
 
 class Model():
     _post_fun=_id
     _est_fun=_id
     _model_fun=_id
     _response_fun=_id
+    _combine_fun=id
     modelType=_TypeFunc()
     responseType=_TypeFunc()
+    bComplex=_TypeFunc(True) # NOTE set in finalized - complex to additional filter responses
+    bSplit=_TypeFunc(True) # NOTE set in finalized - complex to additional filter responses
+
     def __init__(self,modelType='gss',responseType='basic'):
         self.modelType=modelType
         self.responseType=responseType
@@ -808,44 +929,68 @@ class Model():
     def copy(self):
        return Model(**_get_copy_dict(self))
 
-    def finalize(self,stim,dtype):
-        #self._lAll0=jnp.zeros((stim.nStim_Ctg, stim.nCtg, stim.nCtg),dtype=dtype)
-        pass
+    def _finalize(self,bCombine,bSplit):
+       self.bComplex=bCombine
+       self.bSplit=bSplit
 
-
-    @partial(jit, static_argnames=['self'])
+    #-main
+    @partial(jit, static_argnames=['self','bCombine'])
     def lrn_main(self,R,Rm,covMat,nsVar):
-        return self._model_fun(*self._response_fun(R,Rm,covMat,nsVar))
+        return self._model_fun(self._combine_fun(*self._response_fun(R,Rm,covMat,nsVar)))
+
+    #- response
+    @staticmethod
+    @jit
+    def _response__mean(r,rNs,R,RNs,rNsVar,RNsVar,RCovMat):
+        return R,R,RCovMat,RNsVar
 
     @staticmethod
     @jit
-    def _response__mean(_,Rm,covMat,nsVar):
-        return Rm,Rm,covMat,nsVar
+    def _response__basic(r,rNs,R,RNs,rNsVar,RNsVar,RCovMat):
+        return RNs, R, RCovMat,RNsVar
+
+    #- complex
+    @staticmethod
+    @jit
+    def _complex__none(R,Rm,covMat,nsVar):
+        return R,Rm,covMat,nsVar
 
     @staticmethod
     @jit
-    def _response__basic(R,Rm,covMat,nsVar):
-        return R, Rm, covMat,nsVar
+    def _complex__true(R,Rm,covMat,nsVar):
+        return jnp.concat(R.imag,R.real,axis=0), jnp.concat(Rm.imag,Rm.real,axis=0), covMat, jnp.concat(nsVar,nsVar.imag,nsVar.real,axis=0)
+
+    #- split
+    @staticmethod
+    @jit
+    def _split__none(R,Rm,covMat,nsVar):
+        return R,Rm,covMat,nsVar
+
+    @staticmethod
+    @jit
+    def _split__true(R,Rm,covMat,nsVar):
+        # covMat already reshaped
+        return R.reshape(-1,*R.shape[2:]),Rm.reshape(-1,*R.shape[2:]),covMat,nsVar.reshape(-1,*R.shape[2:])
+
 
     #- models
-
-    #@partial(jit, static_argnames=['self'])
     @staticmethod
     @jit
     def _model__gss(R,Rm,covMat,_):
-        #: R   [ nF   x nStim_Ctg x ctg]
-        #: lAll[nStim_ctg x ctg x ctg]
+        #: R    [ nF    x nStim ]
+        #:      [ nF    x nStim_Ctg x nCtg]
+        #:      [ nF x nSplit x nStim_Ctg x nCtg ]
+        #:      [ nStim_Ctg x nCtg x nF x nSplit ] TODO LATER
+        #: lAll [ nStim x nCtg ]  -> [ nStim_Ctg x nCtg x nCtg]
 
         R0=np.transpose(R-jnp.mean(R,axis=1,keepdims=True),(1,2,0))
         mvn=vmap(lambda cov_diag : lax.exp(lmvn0(R0,cov = jnp.diag(cov_diag) + covMat)), in_axes=(1,),out_axes=2)
-        # XXX is abs right for complex values?  could for sure merge responses across nF, could also average
-        #return jnp.abs(mvn(jnp.var(Rm,axis=1)))
         return mvn(jnp.var(Rm,axis=1))
-
 
     @staticmethod
     @jit
     def _model__full(R,Rm,_,nsVar):
+        # XXX
         #nF, nStm_ctg, nCtg = R.shape
         ##pAll [ nStim x nCtg x nCtg]
 
@@ -918,11 +1063,6 @@ class Objective:
     def copy(self):
        return Objective(**_get_copy_dict(self))
 
-    def finalize(self,stim,dtype):
-        pass
-        #self._yHat0=jnp.zeros((stim.nStim_Ctg,stim.nCtg),dtype=dtype)
-        #self._correct0=jnp.zeros((stim.nStim_Ctg,stim.nCtg),dtype=dtype)
-
     @partial(jit, static_argnames=['self'])
     def lrn_main(self,lAll,stimweights,yCtg,Y):
         return self._loss_fun(self._err_fun(self._est_fun(self._posterior_fun(lAll),Y),yCtg),stimweights)
@@ -971,6 +1111,7 @@ class Objective:
     @staticmethod
     @jit
     def _est__cmean(post,Y):
+    # XXX check
         return jnp.angle( jnp.sum( jnp.transpose(post) * jnp.exp(1j*Y) ) / sum(jnp.transpose(post)) )
 
     #- error
@@ -983,6 +1124,11 @@ class Objective:
     @jit
     def _err__map(pAll,_):
         return -jnp.log(Objective._at_correct(pAll))
+
+    @staticmethod
+    @jit
+    def _err__l1(yHat,yCtg):
+        return jnp.abs(yHat-yCtg)
 
     @staticmethod
     @jit
@@ -999,6 +1145,12 @@ class Objective:
     @jit
     def _loss__median(err,stimweights):
         return jnp.median(err*stimweights)
+
+    @staticmethod
+    @jit
+    def _loss__mode(err,stimweights):
+    # XXX check
+        return mode(err*stimweights)
 
     #- helpers
     @staticmethod
@@ -1128,12 +1280,14 @@ class Unit:
 
             ind=self.nrn.filter.index
 
-            stim=self.stim.finalize(self.nrn.dtype,
+            stim=self.stim._finalize(self.nrn.dtype,
                                     stimInd,
                                     self.nrn.bFourier,
                                     self.nrn.bSplit
             )
-            nrn.finalize(stim,
+            model._finalize(self.nrn.bFourier)
+
+            nrn._finalize(stim,
                          self.nrn.dtype,
                          self.nrn.filter.n,
                          ind.ind_lrn,
@@ -1185,6 +1339,8 @@ class Unit:
                                      bSplit,
         )
 
+        self.model._finalize(bFourier)
+
         self.nrn.finalize(self.stim,
                           dtype,
                           n,
@@ -1223,7 +1379,7 @@ class Unit:
         [rng,rng_key] = jxrandom.split(self.rng)
         f0=self.filter.get_f0(rng_key,self.optimizer._f0_jxrand_fun)
 
-        self.out_params,self.opt_state,self.rng_last=self.optimizer.minimize(f0,rng,self.stim,self.filter,self.loss_fun_lrn)
+        self.out_params,self.opt_state,self.rng_last=self.optimizer.minimize(f0,rng,self.stim,self.filter,self._loss_fun_lrn)
         self.filter.extract(self.out_params['f'])
 
     def train_recurse(self,ind_rec=None,fourierType=None,bSplit=None,stimInd=None,dtype=None,optimizer=None):
@@ -1256,7 +1412,7 @@ class Unit:
 
         [rng,rng_key] = jxrandom.split(self.rng_last)
 
-        self.out_params,self.opt_state,self.rng_last=self.optimizer.minimize(self.out,rng,self.stim,self.filter,self.loss_fun_lrn,opt_state=opt_state)
+        self.out_params,self.opt_state,self.rng_last=self.optimizer.minimize(self.out,rng,self.stim,self.filter,self._loss_fun_lrn,opt_state=opt_state)
         self.filter.extract(self.out_params['f'])
 
     def train_append(self,n_append,fourierType=None,bSplit=None,stimInd=None,dtype=None,optimizer=None):
@@ -1284,9 +1440,10 @@ class Unit:
         [rng,rng_key] = jxrandom.split(self.rng_last)
         f0=self.filter.get_f0(rng_key,self.optimizer._f0_jxrand_fun)
 
-        self.out_params,self.opt_state,self.rng_last=self.optimizer.minimize(f0,rng,self.stim,self.filter,self.loss_fun_lrn)
+        self.out_params,self.opt_state,self.rng_last=self.optimizer.minimize(f0,rng,self.stim,self.filter,self._loss_fun_lrn)
         self.filter.extract(self.out_params['f'])
 
+    #- properties
     @property
     def filter(self):
         return self.nrn.filter
@@ -1301,44 +1458,189 @@ class Unit:
 
     @property
     def loss(self):
-        return self.loss_fun({'f':self.filter.out},self.rng,self.stim.val,self.stim.weights,self.stim.yCtg,self.stim.Y)
+        return self._loss_fun({'f':self.filter.out},self.rng,self.stim.val,self.stim.weights,self.stim.yCtg,self.stim.Y)
 
     @property
-    def response(self):
-        return self.nrn.main(self.rng,self.stim.val,self.filter.out)
+    def responses(self):
+        return Response(*self.nrn.main(self.rng,self.stim.val,self.filter.out),self.stim)
+
+    @property
+    def likelihoods(self):
+        return self.model.lrn_main(self.rng,self.stim.val,self.filter.out)
 
     @property
     def error(self):
-        return self.objective._err_fun(self.objective._est_fun(self.objective._posterior_fun(self.response),self.stim.Y),self.stim.yCtg)
+        return self.objective._err_fun(self.objective._est_fun(self.objective._posterior_fun(self.likelihoods),self.stim.Y),self.stim.yCtg)
 
+    #- loss functions
     @partial(jit, static_argnames=['self'])
-    def loss_fun_lrn(self,params,rng_key,stimval,stimweights,yCtg,Y):
+    def _loss_fun_lrn(self,params,rng_key,stimval,stimweights,yCtg,Y):
         return self.objective.lrn_main(self.model.lrn_main(*self.nrn.lrn_main(rng_key,stimval,params['f'])),stimweights,yCtg,Y)
 
     @partial(jit, static_argnames=['self'])
-    def loss_fun(self,params,rng_key,stimval,stimweights,yCtg,Y):
+    def _loss_fun(self,params,rng_key,stimval,stimweights,yCtg,Y):
         return self.objective.lrn_main(self.model.lrn_main(*self.nrn.main(rng_key,stimval,params['f'])),stimweights,yCtg,Y)
 
-    #- out
+    #- plot
     def plot_out(self,bFourier=None,name='f_out'):
         self.filter.plot_out(bFourier=bFourier,name=name)
 
-    def plot_spinner(self,name='plot_spinner'):
-    # R = [nF x nStimCtg x nCtg]
-        R,Rm,covMat=self.response
+    def plot_last(self,bFourier=None,name='f_last'):
+        self.filter.plot_out(bFourier=bFourier,name=name)
 
-        colors=cm.rainbow(np.linspace(0,1,self.stim.nCtg))
-        pairs=list(combinations(range(Rm.shape[0]),2))
+
+
+class Response():
+
+    def __init__(self,r,rNs,R,RNs,rNsVar,RNsVar,RCovMat,stim):
+        self.r=r
+        self.rNs=rNs
+        self.RNs=RNs
+        self.rNsVar=rNsVar
+        self.RNsVar=RNsVar
+        self.RCovMat=RCovMat
+
+        self.bFourier=stim.bIsFourier
+
+        self._stim=stim
+        self.yCtgInd=stim.yCtgInd
+        self.yCtg=stim.yCtg
+
+    @property
+    def nCtg(self):
+        return self.r.shape[-1]
+
+    @property
+    def nF(self):
+        return self.r.shape[0]
+
+    @property
+    def nStim_Ctg(self):
+        return self.r.shape[-2]
+
+    @property
+    def nStim(self):
+        return jnp.multiply.reduce(self.r.shape[-2:-1])
+
+    @property
+    def shape(self):
+        return self.r.shape
+
+    @property
+    def bSplit(self):
+        return self.r.ndim==4
+    @property
+    def nSplit(self):
+        if not self.bSplit:
+            return 0
+        else:
+            return self.r.shape[1]
+
+    def plot_marginal(self,fld='RNs',name='plot_marginal_responses',bSplit=True):
+
+        r=getattr(self,fld)
+
+        colors=cm.rainbow(np.linspace(0,1,self.nCtg))
+
+        marg=list(zip(range(R.shape[0])))
+        if self.bSplit:
+            nSplit=self.nSplit+1
+        else:
+            nSplit=1
+        splits=list(zip(range(nSplit)))
+        components=list(zip(range(int(self.bFourier)+1)))
+        pairs = [t1 + t2 + t3 for t1, t2, t3, in product(marg, splits,components)]
+
+        plt.figure(name)
+        Rm=jnp.zeros(r.shape[2])
+        x=jnp.zeros(r.shape[2])
+        for j in range(len(pairs)):
+            for i in range(self.nCtg):
+                if pairs[4]==0:
+                    c1=np.real
+                else:
+                    c1=np.imag
+
+                if self.bSplit:
+                    R1=c1(r[pairs[j][0],pairs[j][2],:,i])
+                else:
+                    R1=c1(r[pairs[j][0],:,i])
+
+                Rm=Rm+R1
+
+                plt.plot(x,R1,color=colors[i],marker='.',alpha=.4)
+        return
+
+    def plot_joint(self,fld='RNs',name='plot_joint_responses',bSplit=True):
+        """
+        f                         [ nPix x nF ]                       [(nPix / nSplit) x nSplit x nF]
+        stim [ nPix  x nStim ] -> [ nPix  x nStim_Ctg x nCtg ]        [(nPix / nSplit) x nSplit x nStim_Ctg x nCtg]
+        R    [ nF    x nStim ] -> [ nF    x nStim_Ctg x nCtg]         [ nF x nSplit x nStim_Ctg x nCtg ]
+        """
+        # TODO plot marginals at left and bottom
+
+
+        r=getattr(self,fld)
+
+        colors=cm.rainbow(np.linspace(0,1,self.nCtg))
+
+        pairs=list(combinations(range(r.shape[0]),2))
+        if bSplit:
+            nSplit=self.nSplit+1
+        else:
+            nSplit=1
+        splits=list(zip(range(nSplit)))
+        components=list(zip(range(int(self.bFourier)+1)))
+        pairs = [t1 + t2 + t3 + t4 + t5 for t1, t2, t3, t4, t5 in product(pairs, splits,splits,components,components)]
+        # pairs      0,1
+        # splits     2,3
+        # components 4,5
+
         for j in range(len(pairs)):
             plt.figure(name + str(j))
-            for i in range(self.stim.nCtg):
-                if self.stim.bIsFourier:
-                    plt.subplot(1,2,1)
-                    plt.scatter( Rm[pairs[j][0],:,i].real,Rm[pairs[j][1],:,i].real,color=colors[i],marker='.')
-                    plt.subplot(1,2,2)
-                    plt.scatter( Rm[pairs[j][0],:,i].imag,Rm[pairs[j][1],:,i].imag,color=colors[i],marker='.')
+            for i in range(self.nCtg):
+                if pairs[4]==0:
+                    c1=np.real
                 else:
-                    plt.scatter( Rm[pairs[j][0],:,i],Rm[pairs[j][1],:,i],color=colors[i],marker='.')
+                    c1=np.imag
+
+                if pairs[5]==0:
+                    c2=np.real
+                else:
+                    c2=np.imag
+
+                if bSplit:
+                    R1=c1(r[pairs[j][0],pairs[j][2],:,i])
+                    R2=c2(r[pairs[j][1],pairs[j][2],:,i])
+                else:
+                    R1=c1(r[pairs[j][0],:,i])
+                    R2=c2(r[pairs[j][1],:,i])
+
+                plt.scatter( R1,R2,color=colors[i],marker='.',alpha=.4)
+
+    def plot_tsne(self,fld='RNs',name='plot_tsne',bSplit=True,n_components=2,**kwargs):
+        """
+        n_components - ndims to plot
+        perplexity   - number of neighbors to consider (5-50)
+        """
+
+        r=getattr(self,fld)
+        X=r.reshape(r.shape[0],-1).transpose()
+
+        colors=cm.rainbow(np.linspace(0,1,self.nCtg))
+        t=TSNE(n_components=n_components,**kwargs).fit_transform(X).T
+
+        yCtgInd=jnp.repeat(self.yCtgInd,self.nSplit+1)
+
+        plt.figure(name)
+        for i in range(self.nCtg):
+            inds=yCtgInd==i
+            if n_components==2:
+                plt.scatter(t[0][inds],t[1][inds],color=colors[i])
+            elif n_components==3:
+                plt.scatter(t[0][inds],t[1][inds],t[2][inds],color=colors[i])
+            else:
+                TODO
 
 
 
