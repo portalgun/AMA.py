@@ -1,44 +1,47 @@
 """
-f                         [ nPix x nF ]                       [(nPix / nSplit) x nSplit x nF]
-stim [ nPix  x nStim ] -> [ nPix  x nStim_Ctg x nCtg ]        [(nPix / nSplit) x nSplit x nStim_Ctg x nCtg]
-R    [ nF    x nStim ] -> [ nF    x nStim_Ctg x nCtg]         [ nF x nSplit x nStim_Ctg x nCtg ]
-lAll [ nStim x nCtg ]  -> [ nStim x nCtg x nCtg]
-pCor [ nStim x 1 ]
-yHat [ nStim x 1 ]
-iters
-     appendages (new filters)
-     recursions                 - learn
-         batch
-     minimize                   - iter
+Accuracy Maximization Analysis (AMA) with JAX and optax (Burge & Jaini 2017; AMA-Gauss: Jaini & Burge 2017).
 
-        #:
+Pipeline (Unit._loss_fun*):
+    Stim -> Nrn (responses, whitening, noise, normalization) -> Model (log-likelihoods)
+         -> Objective (posterior, estimate, error, loss) -> Optimizer (optax, unit-norm filters)
+
+Shapes (stimuli are grouped by category and padded with zeros; Stim.weights marks the valid stimuli):
+    stim  [ nPix x nStim_Ctg x nCtg ]          split: [ nPix/nSplit x nSplit x nStim_Ctg x nCtg ]
+    f     [ nPix x nF ]                        split: [ nPix/nSplit x nSplit x nF ]
+    R     [ nF x nStim_Ctg x nCtg ]            split: [ nF x nSplit x nStim_Ctg x nCtg ]
+          flattened to real dimensions [ nDim x nStim_Ctg x nCtg ] for the likelihood (_flatten_responses)
+    lAll  [ nStim_Ctg x nCtg(true) x nCtg(candidate) ]   log-likelihoods; log-posteriors after Objective
 """
 
 
 import copy
+import importlib
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax.scipy.special import logsumexp
 import jax.random as jxrandom
 import numpy.random as random
-from jax import grad,jit,vmap,lax,value_and_grad,tree_util,profiler
-from jax.scipy.stats import multivariate_normal as mvn
-from jax.scipy.stats import mode
-import statsmodels.stats.moment_helpers as mh
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
 import optax
-from functools import partial
-import Filter as filt
+from jax import jit,vmap,lax,value_and_grad,tree_util
+from jax.scipy.special import logsumexp
 from jax._src.numpy.util import promote_dtypes_inexact
-from dataclasses import dataclass
+from functools import partial
 from scipy.io import loadmat
 from itertools import combinations, product
-from sklearn.manifold import TSNE 
 
-#log_dir = "logs/fit/" + time.strftime("%Y%m%d-%H%M%S")
-#writer = tf.summary.create_file_writer(log_dir)
+
+class _LazyModule:
+    """imports a module on first attribute access, so that importing ama does not load plotting libraries"""
+    def __init__(self,name):
+        self._name=name
+
+    def __getattr__(self,attr):
+        return getattr(importlib.import_module(self._name),attr)
+
+plt=_LazyModule('matplotlib.pyplot')
+cm=_LazyModule('matplotlib.cm')
+filt=_LazyModule('Filter')
+
 
 def _get_copy_dict(instance,excl=[]):
     flds = [attr for attr in dir(instance) if not attr.startswith('_') and attr not in excl and not callable(getattr(instance,attr))]
@@ -64,9 +67,6 @@ class _Static:
 
     def __eq__(self,other):
         return type(self) is type(other) and self._key()==other._key()
-
-def __is_integer(value):
-    return isinstance(value, int) or (isinstance(value, float) and value.is_integer())
 
 @jit
 def lmvn0(x0,cov):
@@ -1100,9 +1100,6 @@ class Model(_Static):
     def copy(self):
        return Model(**_get_copy_dict(self))
 
-    def _finalize(self,*_):
-        pass
-
     #-main
     @partial(jit, static_argnames=['self'])
     def lrn_main(self,R,Rm,RVar,noiseCov,noiseCorr,weights):
@@ -1835,6 +1832,7 @@ class Response():
         X=r.reshape(r.shape[0],-1).T[mask]
         yCtgInd=np.asarray(self.yCtgInd).ravel()[mask]
 
+        from sklearn.manifold import TSNE
         colors=cm.rainbow(np.linspace(0,1,self.nCtg))
         t=TSNE(n_components=n_components,**kwargs).fit_transform(X).T
 

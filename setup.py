@@ -11,7 +11,7 @@ setup(
         'Filter @ https://github.com/portalgun/Filter.py.git',
         'numpy>=2.0.2',
         'jax>=0.4.35',
-        'statsmodels>=0.14.4',
+        'scikit-learn>=1.5',
         'matplotlib>=3.9.2',
         'scipy>=1.14.1'
     ]
