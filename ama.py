@@ -44,6 +44,9 @@ plt=_LazyModule('matplotlib.pyplot')
 cm=_LazyModule('matplotlib.cm')
 filt=_LazyModule('Filter')
 
+# optax transformations by (optimizerType, lRate0), shared by all Optimizers (see Optimizer.tx)
+_TX_CACHE={}
+
 
 def contrast_normalize(stimuli):
     """mean-subtract each stimulus (last axis) and scale it to unit L2 norm, as AMA assumes (Burge & Jaini 2017)"""
@@ -154,6 +157,24 @@ def _plot_signal(y,bFourier=False,clim=None):
                 plt.clim(*clim)
     else:
         raise Exception('plotting is only implemented for 1D and 2D stimuli')
+
+class _BoundLoss:
+    """
+    a loss method of a settings-hashed object (_Static) for use as a static jit argument. Bound methods compare their
+    objects by identity, so passing unit._loss_fun_lrn directly would compile training again for every new Unit.
+    """
+    def __init__(self,owner,name):
+        self.owner=owner
+        self.name=name
+
+    def __call__(self,*args):
+        return getattr(self.owner,self.name)(*args)
+
+    def __hash__(self):
+        return hash((self.owner,self.name))
+
+    def __eq__(self,other):
+        return isinstance(other,_BoundLoss) and self.name==other.name and self.owner==other.owner
 
 class _ParentProp:
     def __init__(self, pname=None,default=None):
@@ -1474,12 +1495,12 @@ class Optimizer():
 
     @property
     def tx(self):
-        # one optax transformation per setting; a new object each call would force recompilation
+        # one optax transformation per setting, shared by all Optimizers: a new transformation object would compile the
+        # training step again (e.g. for every new Unit or cross-validation fold)
         key=(self.optimizerType,self.lRate0)
-        if getattr(self,'_tx_key',None)!=key:
-            self._tx=self.optimizer(self.lRate0)
-            self._tx_key=key
-        return self._tx
+        if key not in _TX_CACHE:
+            _TX_CACHE[key]=self.optimizer(self.lRate0)
+        return _TX_CACHE[key]
 
     @staticmethod
     @partial(jit, static_argnames=['proj_fun','proj_params'])
@@ -1741,7 +1762,7 @@ class Unit(_Static):
 #- LEARN MODES
     def _run(self,f0,rng,opt_state=None):
         self._check_batches()
-        self.out_params,self.opt_state,self.rng_last=self.optimizer.minimize(f0,rng,self.stim,self.filter,self._loss_fun_lrn,opt_state=opt_state)
+        self.out_params,self.opt_state,self.rng_last=self.optimizer.minimize(f0,rng,self.stim,self.filter,_BoundLoss(self,'_loss_fun_lrn'),opt_state=opt_state)
         self._opt_param_shape=self.out_params['f'].shape
         self.filter.extract(self.out_params['f'])
 

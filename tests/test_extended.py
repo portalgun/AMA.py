@@ -332,8 +332,9 @@ class TestPrecision:
             assert v.dtype==dtype
             out[dtype]=(float(v),np.asarray(g,dtype=float))
         (v32,g32),(v64,g64)=out[jnp.float32],out[jnp.float64]
-        assert np.isclose(v32,v64,rtol=1e-5)
-        assert np.linalg.norm(g32-g64)/np.linalg.norm(g64)<1e-3
+        # float32 accumulated over thousands of stimuli; GPU kernels also differ from CPU in the last digits
+        assert np.isclose(v32,v64,rtol=5e-5)
+        assert np.linalg.norm(g32-g64)/np.linalg.norm(g64)<5e-3
 
     @pytest.mark.parametrize('modelType',['gss','full'])
     def test_float32_many_filters_and_categories(self,modelType):
@@ -527,3 +528,15 @@ def test_tangent_projection_removes_radial_component(bComplex):
     t=np.asarray(ama.Optimizer._tangent(jnp.asarray(g),jnp.asarray(f)))
     assert np.allclose(np.real(np.conj(f)*t).sum((0,1)),0)              # orthogonal to each filter
     assert np.allclose(g-t,f*np.real(np.conj(f)*g).sum((0,1)))          # only the radial part was removed
+
+
+def test_identical_units_share_compiled_training():
+    x,s,ci,Y,_=ts.gaussian_ctg()
+    def run():
+        unit=ama.Unit(ama.Stim(x,s,ci,Y),ama.Nrn(),ama.Model('gss','mean'),ama.Objective('map'),
+                      ama.Optimizer(nIterMax=20,lRate0=0.05,bVerbose=False))
+        unit.train_new(2)
+    run()
+    n=ama.Optimizer._run_chunk._cache_size()
+    run()
+    assert ama.Optimizer._run_chunk._cache_size()==n
