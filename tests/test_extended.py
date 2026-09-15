@@ -2,6 +2,8 @@
 Noise, complex gradients, feature combinations, edge cases, precision, rarely used paths, plotting,
 determinism, and training against the burgelab reference.
 """
+import warnings
+
 import numpy as np
 import pytest
 import jax
@@ -82,7 +84,9 @@ class TestNoise:
     def test_noise_before_normalization(self):
         # unnormalized stimuli (||s||=2) with broadband normalization: stage-1 noise is divided by ||s|| too
         x,s,ci,Y,_=ts.unequal_counts()
-        unit=unit_from(ama.Stim(x,2*s,ci,Y),ama.Nrn(bNoise_1=True,normalizeType='broad',eps=0.),responseType='basic')
+        with pytest.warns(UserWarning,match='contrast normalized'):
+            stim=ama.Stim(x,2*s,ci,Y)
+        unit=unit_from(stim,ama.Nrn(bNoise_1=True,normalizeType='broad',eps=0.),responseType='basic')
         f=unit.filter.out_flat
         outs=jax.vmap(lambda k: unit.nrn.main(k,unit.stim.val,f))(jax.random.split(jax.random.key(1),4000))
         r,R,RNs=np.asarray(outs[0][0]),np.asarray(outs[2][0]),np.asarray(outs[3])
@@ -90,6 +94,8 @@ class TestNoise:
         assert np.allclose(R[:,w],r[:,w]/2)
         assert np.allclose(RNs.mean(0)[:,w],R[:,w],atol=0.1)
         assert np.allclose(RNs.var(0)[:,w],(1.36*np.abs(r[:,w])+0.23)/4,rtol=0.12)
+        RVar=np.asarray(outs[4][0])
+        assert np.allclose(RVar[:,w],(1.36*np.abs(r[:,w])+0.23)/4)          # the likelihood accounts for stage-1 noise
 
     def test_noise_is_redrawn_each_iteration(self):
         x,s,ci,Y,_=ts.gaussian_ctg()
@@ -219,7 +225,10 @@ class TestCombinations:
     def test_broadband_normalization_in_pipeline(self):
         x,s,ci,Y,_=ts.unequal_counts()
         for scale in [1,2]:
-            unit=unit_from(ama.Stim(x,scale*s,ci,Y),ama.Nrn(normalizeType='broad',eps=0.))
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                stim=ama.Stim(x,scale*s,ci,Y)
+            unit=unit_from(stim,ama.Nrn(normalizeType='broad',eps=0.))
             r,_,R,_,_=unit.nrn.main(unit.rng,unit.stim.val,unit.filter.out_flat)
             w=np.asarray(unit.stim.weights)>0
             assert np.allclose(np.asarray(R)[:,w],np.asarray(r)[:,w]/scale)

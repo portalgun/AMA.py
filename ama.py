@@ -16,6 +16,7 @@ Shapes (stimuli are grouped by category and padded with zeros; Stim.weights mark
 
 import copy
 import importlib
+import warnings
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -42,6 +43,22 @@ plt=_LazyModule('matplotlib.pyplot')
 cm=_LazyModule('matplotlib.cm')
 filt=_LazyModule('Filter')
 
+
+def contrast_normalize(stimuli):
+    """mean-subtract each stimulus (last axis) and scale it to unit L2 norm, as AMA assumes (Burge & Jaini 2017)"""
+    s=np.asarray(stimuli,dtype=float)
+    flat=np.reshape(s,(-1,s.shape[-1]))
+    flat=flat-flat.mean(axis=0,keepdims=True)
+    norm=np.linalg.norm(flat,axis=0,keepdims=True)
+    return np.reshape(flat/np.where(norm>0,norm,1),s.shape)
+
+def _warn_if_not_contrast_normalized(stimuli,tol=1e-3):
+    # stimuli [ nPix x nStim ]; the mean component's norm is |mean|*sqrt(nPix)
+    norm=np.linalg.norm(stimuli,axis=0)
+    mean=np.abs(stimuli.mean(axis=0))*np.sqrt(stimuli.shape[0])
+    if np.any(np.abs(norm-1)>tol) or np.any(mean>tol):
+        warnings.warn('stimuli are not contrast normalized (zero mean, unit norm), which AMA assumes; '
+                      'pass bContrastNormalize=True to Stim or use ama.contrast_normalize',stacklevel=3)
 
 def _get_copy_dict(instance,excl=[]):
     flds = [attr for attr in dir(instance) if not attr.startswith('_') and attr not in excl and not callable(getattr(instance,attr))]
@@ -275,11 +292,12 @@ class Stim:
         out.nStim=out.nStim_Ctg*out.nCtg
         return out
 
-    def __init__(self,x,stimuli,yCtgInd,Y,bStimIsFourier=False,nSplit=0,bStimIsSplit=False):
+    def __init__(self,x,stimuli,yCtgInd,Y,bStimIsFourier=False,nSplit=0,bStimIsSplit=False,bContrastNormalize=False):
         """
-        stimuli [ *dims x nStim ]
+        stimuli [ *dims x nStim ], contrast normalized (zero mean, unit norm; a warning is given otherwise)
         yCtgInd [ nStim ] category label of each stimulus (any integer coding, e.g. 1-based from matlab)
         Y       [ nCtg ]  latent variable value of each category, in sorted label order
+        bContrastNormalize - contrast normalize the stimuli (spatial domain only)
         """
 
         self.bIsFourier=bStimIsFourier
@@ -307,6 +325,12 @@ class Stim:
         self.nStim_Ctg=int(np.max(nStimCtg))
 
         stimuli=np.reshape(stimuli,(self.nPix,len(yCtgInd)))
+        if bContrastNormalize:
+            if bStimIsFourier:
+                raise Exception('contrast normalize stimuli in the spatial domain')
+            stimuli=contrast_normalize(stimuli)
+        elif not bStimIsFourier:
+            _warn_if_not_contrast_normalized(stimuli)
         val=np.zeros((self.nPix,self.nStim_Ctg,self.nCtg),dtype=stimuli.dtype)
         weights=np.zeros((self.nStim_Ctg,self.nCtg))
         yctg=np.zeros((self.nStim_Ctg,self.nCtg))
@@ -429,7 +453,7 @@ class Stim:
     def gen_test(cls,dims=(8,9),nStim=101):
         a=random.randn(*(dims+(int(np.ceil(nStim/2)),)))
         b=random.rand( *(dims+(int(np.floor(nStim/2)),)))
-        stimuli=np.concatenate((a,b),len(dims))
+        stimuli=contrast_normalize(np.concatenate((a,b),len(dims)))
         yCtgInd=np.concatenate((np.zeros(a.shape[-1],dtype=int),np.ones(b.shape[-1],dtype=int)),0)
         X=np.array([1, 2])
 
@@ -682,9 +706,13 @@ class Nrn(_Static):
         R      = r + eta,  eta ~ N(0, sigma2)
     optionally with an activation, normalization, and noise before (1) and/or after (2) normalization.
 
-    The likelihood (Model) always assumes noise of variance fano*|R| + var0 on the final responses, including when no
-    noise is sampled (responseType='mean', the mean-response approximation of Burge & Jaini 2017). Noise sampled before
-    normalization (bNoise_1) is not accounted for by the likelihood; with both stages on, only stage 2 is.
+    The likelihood (Model) uses the noise variance of the final responses (Nrn._likelihood_variance):
+      stage 2 (after normalization): fano*|R| + var0; also used when no noise is sampled (responseType='mean', the
+                                     mean-response approximation of Burge & Jaini 2017)
+      stage 1 (bNoise_1, before normalization): fano*|r| + var0 carried through the normalization, exactly for 'broad' and
+                                     'narrow' and to first order for 'gen' (which underestimates, by ~5-10% when noise is
+                                     ~10% of the pooled response); with both stages on, the variances add, with
+                                     stage 2's scaled by the expected |response| given stage-1 noise
     rho correlates the noise of all response dimensions (filters, sub-filters, real/imaginary components) equally.
     """
     _noise_1_fun=_id
@@ -815,7 +843,39 @@ class Nrn(_Static):
         # noisey output 2
         RNs = self._average_fun(self._noise_2_fun(RN,self.fano,self.var0,self.nSamples,rng_key2,self.rho))
 
-        return r,rNs,R,RNs,self.variance(R,self.fano,self.var0)
+        return r,rNs,R,RNs,self._likelihood_variance(r,R)
+
+    def _likelihood_variance(self,r,R):
+        # see the class docstring. r: responses before normalization, R: after
+        if not self.bNoise_1:
+            return self.variance(R,self.fano,self.var0)
+        v1=self.variance(r,self.fano,self.var0)
+        if str(self.normalizeType).lower()=='gen':
+            # R_i = r_i/D, D = eps + sum_k |r_k|:  var(R_i) ~ sum_j (dR_i/dr_j)^2 v_j  (real responses)
+            axes=tuple(range(r.ndim-2))
+            D=self.eps + jnp.sum(jnp.abs(r),axis=axes,keepdims=True)
+            D=jnp.where(D>0,D,1)
+            V=jnp.sum(v1,axis=axes,keepdims=True)
+            var=v1/D**2 - 2*jnp.abs(r)*v1/D**3 + r**2*V/D**4
+        else:
+            # linear normalizations scale each response by |R|/|r| (padding, where r = 0, keeps gain 1)
+            r2=jnp.real(r*jnp.conj(r))
+            R2=jnp.real(R*jnp.conj(R))
+            var=v1*jnp.where(r2>0,R2/jnp.where(r2>0,r2,1),1)
+        if self.bNoise_2:
+            # stage-2 noise is scaled by the noisy stage-1 response: E[fano*|RN| + var0], RN ~ N(R, var) per component
+            var=var+self._expected_variance(R,var)
+        return var
+
+    def _expected_variance(self,R,var):
+        def comp(mu,v):
+            sd=jnp.sqrt(v)
+            sd_safe=jnp.where(sd>0,sd,1)
+            folded=jnp.where(sd>0,sd*jnp.sqrt(2/jnp.pi)*jnp.exp(-mu**2/(2*sd_safe**2)) + mu*jax.scipy.special.erf(mu/(sd_safe*jnp.sqrt(2))),jnp.abs(mu))
+            return self.fano*folded + self.var0
+        if jnp.iscomplexobj(R):
+            return comp(R.real,var.real) + 1j*comp(R.imag,var.imag)
+        return comp(R,var)
 
     @staticmethod
     def variance(R,fano,var0):
@@ -1084,18 +1144,23 @@ class Model(_Static):
            Lambda_i      = noise covariance from Nrn (mean noise variance in category i)
     'full' original AMA (Burge & Jaini 2017, Eq 5):  p(R|X_i) = 1/N_i sum_j N(R; r_ij, diag(sigma2_ij))
     The prior p(X_i)=N_i/N is applied by Objective, so the posterior equals Eq 5 exactly.
+
+    bLeaveOneOut ('full' only) - leave the decoded stimulus out of its own category, so the posterior is Eq 5 with that
+                   stimulus removed from the training set. Otherwise each stimulus matches its own mean response, which
+                   makes the cost optimistic when noise is low or categories (or batches) are small.
     """
     _model_fun=_id
     _response_fun=_id
     modelType=_TypeFunc()
     responseType=_TypeFunc()
 
-    def __init__(self,modelType='gss',responseType='basic'):
+    def __init__(self,modelType='gss',responseType='basic',bLeaveOneOut=False):
         self.modelType=modelType
         self.responseType=responseType
+        self.bLeaveOneOut=bLeaveOneOut
 
     def _key(self):
-        return (self.modelType,self.responseType)
+        return (self.modelType,self.responseType,self.bLeaveOneOut)
 
     def copy(self):
        return Model(**_get_copy_dict(self))
@@ -1103,7 +1168,7 @@ class Model(_Static):
     #-main
     @partial(jit, static_argnames=['self'])
     def lrn_main(self,R,Rm,RVar,noiseCov,noiseCorr,weights):
-        return self._model_fun(R,Rm,RVar,noiseCov,noiseCorr,weights)
+        return self._model_fun(R,Rm,RVar,noiseCov,noiseCorr,weights,self.bLeaveOneOut)
 
     #- response: which responses are decoded. returns observed, mean, variance
     @staticmethod
@@ -1118,7 +1183,7 @@ class Model(_Static):
 
     #- models
     @staticmethod
-    def _model__gss(R,Rm,RVar,noiseCov,noiseCorr,weights):
+    def _model__gss(R,Rm,RVar,noiseCov,noiseCorr,weights,bLeaveOneOut=False):
         #: R, Rm [ nF x nStim_Ctg x nCtg ]
         #: lAll  [ nStim_Ctg x nCtg x nCtg ]
         nF=R.shape[0]
@@ -1132,7 +1197,7 @@ class Model(_Static):
         return lmvn0(x,cov[None,None])
 
     @staticmethod
-    def _model__full(R,Rm,RVar,noiseCov,noiseCorr,weights):
+    def _model__full(R,Rm,RVar,noiseCov,noiseCorr,weights,bLeaveOneOut=False):
         #: lAll[l,k,i] = log mean_j N(R[:,l,k]; Rm[:,j,i], S_ji P S_ji),  S_ji = diag(sqrt(RVar[:,j,i]))
         #: P is the noise correlation matrix (identity when noiseCorr is None). Quadratic forms are expanded in R, so no
         #: [ nF x l x j x i ] tensor is formed.
@@ -1158,12 +1223,19 @@ class Model(_Static):
             B=a[:,None]*a[None,:]*Pinv[:,:,None,None]                              # [ nF x nF x j x i ]
             quad=lambda Rk: jnp.einsum('fl,gl,fgji->lji',Rk,Rk,B)
 
-        def per_true_ctg(Rk):
-            # Rk [ nF x nStim_Ctg(l) ] -> [ nStim_Ctg(l) x nCtg(i) ]
+        nStim,nCtg=weights.shape
+        self_match=jnp.eye(nStim,dtype=bool)[:,:,None]                             # [ l x j x 1 ]
+
+        def per_true_ctg(args):
+            # Rk [ nF x nStim_Ctg(l) ] of true category k -> [ nStim_Ctg(l) x nCtg(i) ]
+            Rk,k=args
             q=-0.5*quad(Rk) + jnp.einsum('fl,fji->lji',Rk,aPm) + c[None]
+            if bLeaveOneOut:
+                q=jnp.where(self_match & (jnp.arange(nCtg)==k)[None,None,:],-jnp.inf,q)
             return logsumexp(q,axis=1)
 
-        lAll=lax.map(per_true_ctg,jnp.moveaxis(R,-1,0)) - jnp.log(wc)[None,None,:]  # [ nCtg(k) x nStim_Ctg x nCtg ]
+        # dividing by N_i also for the left-out category keeps the posterior (with the prior N_i/N) in Eq 5's sum form
+        lAll=lax.map(per_true_ctg,(jnp.moveaxis(R,-1,0),jnp.arange(nCtg))) - jnp.log(wc)[None,None,:]  # [ nCtg(k) x nStim_Ctg x nCtg ]
         return jnp.moveaxis(lAll,0,1)
 
 
@@ -1312,13 +1384,14 @@ class Objective(_Static):
 
 class Optimizer():
     def __init__(self,optimizerType='adam',projectionType=['l2_sphere',1],lRate0=1e-1,nIterMax=1000,f0_jxrand_fun=['ball',1],
-                 batchSize=None,nStepsPerChunk=100,bVerbose=True):
+                 batchSize=None,nStepsPerChunk=100,bVerbose=True,nBatchMinCtg=2):
         """
         batchSize      - None for full-batch learning, or the approximate number of stimuli per iteration (AMA-SGD,
                          Burge & Jaini 2017). Each iteration draws a new random batch, stratified so every category keeps
-                         its share of the training set (the prior) with at least 2 stimuli. Posteriors are computed
+                         its share of the training set (the prior) with at least nBatchMinCtg stimuli. Posteriors are computed
                          against the batch, so full AMA costs O(batchSize^2) per iteration. loss_hist holds batch costs.
         nStepsPerChunk - iterations compiled into one lax.scan; the loss is reported once per chunk
+        nBatchMinCtg   - minimum stimuli per category in a batch (AMA-Gauss needs more than the number of response dimensions)
         """
         # filters are constrained to unit length, ||f||=1 (Burge & Jaini 2017)
         self.optimizerType=optimizerType
@@ -1330,6 +1403,7 @@ class Optimizer():
         if isinstance(f0_jxrand_fun[0],str):
             self._f0_jxrand_fun[0]=getattr(jxrandom,f0_jxrand_fun[0])
         self.batchSize=batchSize
+        self.nBatchMinCtg=nBatchMinCtg
         self.nStepsPerChunk=nStepsPerChunk
         self.bVerbose=bVerbose
 
@@ -1375,7 +1449,7 @@ class Optimizer():
     def _batch_plan(self,weights):
         # number of stimuli drawn from each category per iteration, proportional to the category's size
         counts=np.asarray(weights).sum(0).astype(int)
-        m=np.maximum(2,np.round(self.batchSize*counts/counts.sum())).astype(int)
+        m=np.maximum(self.nBatchMinCtg,np.round(self.batchSize*counts/counts.sum())).astype(int)
         m=np.minimum(m,counts)
         mMax=int(m.max())
         mask=(np.arange(mMax)[:,None] < m[None,:]).astype(np.asarray(weights).dtype)  # [ mMax x nCtg ]
@@ -1566,6 +1640,21 @@ class Unit(_Static):
         self._check()
 
 
+    @property
+    def _nDim(self):
+        # flattened real response dimensions
+        return self.nrn.filter.n*(2 if self.nrn.bAnalytic else 1)*(self.nrn.filter.nSplit if self.nrn.bSplit else 1)
+
+    def _check_batches(self):
+        if self.optimizer.batchSize is None or self.model.modelType!='gss':
+            return
+        _,mask=self.optimizer._batch_plan(self.stim.weights)
+        mMin=int(np.asarray(mask).sum(0).min())
+        if mMin < self._nDim+1:
+            warnings.warn('batches have as few as ' + str(mMin) + ' stimuli in a category, fewer than the ' + str(self._nDim+1)
+                          + ' needed for a full-rank AMA-Gauss covariance of ' + str(self._nDim) + ' response dimensions; '
+                          'increase batchSize or Optimizer nBatchMinCtg',stacklevel=3)
+
     def _check(self):
         counts=np.asarray(self.stim.weights).sum(0)
         if self.model.modelType=='gss' and np.any(counts<2):
@@ -1573,7 +1662,7 @@ class Unit(_Static):
         if self.model.modelType=='full' and self.nrn.corrType=='None':
             raise Exception("modelType='full' needs response noise; rho=None (no noise) is only supported with modelType='gss'")
         if self.nrn.corrType=='corr' and self.nrn.bFinalized:
-            nDim=self.nrn.filter.n*(2 if self.nrn.bAnalytic else 1)*(self.nrn.filter.nSplit if self.nrn.bSplit else 1)
+            nDim=self._nDim
             lo=-1/(nDim-1) if nDim>1 else -np.inf
             if not (lo < self.nrn.rho < 1):
                 raise Exception('rho must be in (' + str(lo) + ', 1) for ' + str(nDim) + ' response dimensions')
@@ -1585,12 +1674,23 @@ class Unit(_Static):
             if self.nrn.normalizeType=='narrow':
                 raise Exception("whitening can not be combined with normalizeType='narrow'")
             if str(self.nrn.whitenType).lower()=='response' and self.nrn.bFinalized:
-                nDim=self.nrn.filter.n*(2 if self.nrn.bAnalytic else 1)*(self.nrn.filter.nSplit if self.nrn.bSplit else 1)
+                nDim=self._nDim
                 if nDim >= counts.sum():
                     raise Exception("whitenType='response' needs more stimuli (" + str(int(counts.sum())) + ') than response dimensions (' + str(nDim) + ')')
+        if self.model.bLeaveOneOut:
+            if self.model.modelType!='full':
+                raise Exception("bLeaveOneOut is only implemented for modelType='full'")
+            if self.objective.errType=='mle':
+                raise Exception("bLeaveOneOut defines a leave-one-out posterior and can not be used with errType='mle'")
+            if np.any(counts<2):
+                raise Exception('bLeaveOneOut needs at least 2 stimuli in every category')
+        if (self.nrn.bNoise_1 and str(self.nrn.normalizeType).lower()=='gen' and self.nrn.bFinalized
+                and self.nrn.bAnalytic and not self.nrn._bWhiten):
+            raise Exception("stage-1 noise (bNoise_1) with normalizeType='gen' is only modeled for real responses (not fourierType=2)")
 
 #- LEARN MODES
     def _run(self,f0,rng,opt_state=None):
+        self._check_batches()
         self.out_params,self.opt_state,self.rng_last=self.optimizer.minimize(f0,rng,self.stim,self.filter,self._loss_fun_lrn,opt_state=opt_state)
         self._opt_param_shape=self.out_params['f'].shape
         self.filter.extract(self.out_params['f'])
