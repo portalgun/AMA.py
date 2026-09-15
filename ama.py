@@ -16,6 +16,7 @@ Shapes (stimuli are grouped by category and padded with zeros; Stim.weights mark
 
 import copy
 import importlib
+import pickle
 import warnings
 import numpy as np
 import jax
@@ -348,6 +349,52 @@ class Stim:
         if self.bIsSplit:
             self.bIsSplit=False
             self.split()
+
+    #- held-out data
+    def _valid_indices(self):
+        w=np.asarray(self.weights)>0
+        return [np.flatnonzero(w[:,c]) for c in range(self.nCtg)]
+
+    def _take(self,inds):
+        # stimuli by within-category index (one index array per category), regrouped and zero padded as in __init__
+        mMax=max(len(i) for i in inds)
+        idx=np.zeros((mMax,self.nCtg),dtype=int)
+        w=np.zeros((mMax,self.nCtg))
+        for c,i in enumerate(inds):
+            idx[:len(i),c]=i
+            w[:len(i),c]=1
+        out=copy.copy(self)
+        idx=jnp.asarray(idx)
+        wj=jnp.asarray(w,dtype=jnp.asarray(self.weights).dtype)
+        out.val=jnp.take_along_axis(self.val,jnp.broadcast_to(idx,self.val.shape[:-2]+idx.shape),axis=-2)*wj.astype(self.val.dtype)
+        out.weights=wj
+        out.yCtg=jnp.take_along_axis(jnp.asarray(self.yCtg),idx,axis=0)
+        out.yCtgInd=jnp.take_along_axis(jnp.asarray(self.yCtgInd),idx,axis=0)
+        out.nStim_Ctg=mMax
+        out.nStim=mMax*self.nCtg
+        return out
+
+    def train_test(self,testFraction=0.2,seed=0):
+        """random (train, test) split, stratified by category; each category keeps at least one stimulus in each part"""
+        rng=np.random.default_rng(seed)
+        train,test=[],[]
+        for i in self._valid_indices():
+            i=rng.permutation(i)
+            nTest=int(np.clip(np.round(testFraction*len(i)),1,len(i)-1))
+            test.append(np.sort(i[:nTest]))
+            train.append(np.sort(i[nTest:]))
+        return self._take(train),self._take(test)
+
+    def folds(self,k=5,seed=0):
+        """k cross-validation folds [(train, test), ...], stratified by category; every stimulus is tested once"""
+        rng=np.random.default_rng(seed)
+        parts=[np.array_split(rng.permutation(i),k) for i in self._valid_indices()]
+        out=[]
+        for f in range(k):
+            test=[np.sort(p[f]) for p in parts]
+            train=[np.sort(np.concatenate([p[g] for g in range(k) if g!=f])) for p in parts]
+            out.append((self._take(train),self._take(test)))
+        return out
 
     @property
     def _pix_dims(self):
@@ -1303,8 +1350,10 @@ class Objective(_Static):
        return Objective(**_get_copy_dict(self),_bCopy=True)
 
     @partial(jit, static_argnames=['self'])
-    def lrn_main(self,lAll,stimweights,yCtg,Y):
-        return self._loss_fun(self._err_fun(self._est_fun(self._posterior_fun(lAll,stimweights),Y),yCtg),stimweights)
+    def lrn_main(self,lAll,stimweights,yCtg,Y,priorweights=None):
+        # the prior comes from priorweights (the training stimuli) when decoding other stimuli
+        prior=stimweights if priorweights is None else priorweights
+        return self._loss_fun(self._err_fun(self._est_fun(self._posterior_fun(lAll,prior),Y),yCtg),stimweights)
 
     #- posterior (log domain)
     @staticmethod
@@ -1547,6 +1596,7 @@ class Unit(_Static):
         self.objective=objective
         self.optimizer=optimizer
         self.opt_state=None
+        self.restart_costs=None
 
         if seed is None:
             seed=666
@@ -1695,7 +1745,29 @@ class Unit(_Static):
         self._opt_param_shape=self.out_params['f'].shape
         self.filter.extract(self.out_params['f'])
 
-    def train_new(self,n,fourierType=None,bSplit=None,stimInd=None,dtype=None,optimizer=None):
+    def _train_random(self,rng,nRestarts):
+        # learn from random initial filters; with restarts, keep the run with the lowest cost on the training stimuli
+        if nRestarts<1:
+            raise Exception('nRestarts must be at least 1')
+        self.restart_costs=[]
+        best=None
+        for i in range(nRestarts):
+            if i>0:
+                rng=jxrandom.fold_in(rng,i)
+            rng,rng_key = jxrandom.split(rng)
+            f0=self.filter.get_f0(rng_key,self.optimizer._f0_jxrand_fun)
+            self._run(f0,rng)
+            if nRestarts==1:
+                self.restart_costs=None
+                return
+            cost=float(self.loss)
+            self.restart_costs.append(cost)
+            if best is None or cost<best[0]:
+                best=(cost,jnp.asarray(self.filter.out),self.out_params,self.opt_state,self.rng_last,
+                      list(self.optimizer.loss_hist),self._opt_param_shape)
+        _,self.filter.out,self.out_params,self.opt_state,self.rng_last,self.optimizer.loss_hist,self._opt_param_shape=best
+
+    def train_new(self,n,fourierType=None,bSplit=None,stimInd=None,dtype=None,optimizer=None,nRestarts=1):
         if optimizer is not None:
             self.optimizer=optimizer
 
@@ -1709,9 +1781,7 @@ class Unit(_Static):
                       bSplit=bSplit
         )
 
-        rng,rng_key = jxrandom.split(self.rng)
-        f0=self.filter.get_f0(rng_key,self.optimizer._f0_jxrand_fun)
-        self._run(f0,rng)
+        self._train_random(self.rng,nRestarts)
 
     def train_recurse(self,ind_rec=None,fourierType=None,bSplit=None,stimInd=None,dtype=None,optimizer=None):
         if optimizer is not None:
@@ -1741,7 +1811,7 @@ class Unit(_Static):
         rng,_ = jxrandom.split(self.rng if self.rng_last is None else self.rng_last)
         self._run(f0,rng,opt_state)
 
-    def train_append(self,n_append,fourierType=None,bSplit=None,stimInd=None,dtype=None,optimizer=None):
+    def train_append(self,n_append,fourierType=None,bSplit=None,stimInd=None,dtype=None,optimizer=None,nRestarts=1):
         if optimizer is not None:
             self.optimizer=optimizer
 
@@ -1759,9 +1829,146 @@ class Unit(_Static):
                       last=self.out
         )
 
-        rng,rng_key = jxrandom.split(self.rng if self.rng_last is None else self.rng_last)
-        f0=self.filter.get_f0(rng_key,self.optimizer._f0_jxrand_fun)
-        self._run(f0,rng)
+        self._train_random(self.rng if self.rng_last is None else self.rng_last,nRestarts)
+
+    #- evaluation
+    def _prepare_stim(self,stim):
+        # other stimuli in this unit's learning domain and precision
+        if not self.nrn.bFinalized:
+            raise Exception('train (or finalize) the unit first')
+        if stim.nCtg!=self.stim.nCtg or not np.allclose(np.asarray(stim.Y),np.asarray(self.stim.Y)):
+            raise Exception('stimuli must have the same categories (Y) as the training stimuli')
+        return copy.copy(stim)._finalize(self.nrn.dtype,None,self.nrn.bFourier,self.nrn.bSplit)
+
+    @partial(jit, static_argnames=['self'])
+    def _loss_fun_heldout(self,params,rng_key,stimval,stimweights,yCtg,Y,refval,refweights):
+        f=params['f']
+        W=self.nrn.whitening(refval,f,refweights) if self.nrn._bWhiten else None
+        obs=self.nrn.main(rng_key,stimval,f,stimweights,W)
+        ref=self.nrn.main(rng_key,refval,f,refweights,W)
+        return self.objective.lrn_main(self._likelihoods_heldout(obs,ref,refweights),stimweights,yCtg,Y,refweights)
+
+    def evaluate(self,stim):
+        """
+        cost of decoding other stimuli (e.g. a held-out test set) with the current filters. This unit's stimuli are the
+        training set: the category response distributions (AMA-Gauss), the reference stimuli (full AMA), the prior,
+        and the whitening all come from them.
+        """
+        test=self._prepare_stim(stim)
+        return float(self._loss_fun_heldout({'f':self.filter.out_flat},self.rng,test.val,test.weights,test.yCtg,test.Y,
+                                            self.stim.val,self.stim.weights))
+
+    def _log_posterior(self,stim=None):
+        f=self.filter.out_flat
+        if stim is None:
+            return Objective._posterior__true(self.likelihoods,self.stim.weights),self.stim
+        test=self._prepare_stim(stim)
+        W=self.nrn.whitening(self.stim.val,f,self.stim.weights) if self.nrn._bWhiten else None
+        obs=self.nrn.main(self.rng,test.val,f,test.weights,W)
+        ref=self.nrn.main(self.rng,self.stim.val,f,self.stim.weights,W)
+        return Objective._posterior__true(self._likelihoods_heldout(obs,ref,self.stim.weights),self.stim.weights),test
+
+    def estimates(self,estType='mode',stim=None):
+        """
+        estimates of the latent variable [ nStim_Ctg x nCtg ] (grouped like Stim.val; see Stim.weights) for the training
+        stimuli, or for other stimuli decoded with the training set: 'mode' (MAP), 'mean' (MMSE), 'median', or
+        'cmean' (circular mean, Y in radians)
+        """
+        lpost,st=self._log_posterior(stim)
+        return np.asarray(getattr(Objective,'_est__'+estType)(lpost,st.Y))
+
+    def performance(self,estType='mode',stim=None):
+        """
+        estimation performance per latent level for the training stimuli, or for other stimuli decoded with the training
+        set: bias, sd, and rmse of the estimates; pCorrect and confusion [ true x MAP category ] of the MAP category;
+        and cost, the mean -log posterior at the correct level
+        """
+        lpost,st=self._log_posterior(stim)
+        lpost=np.asarray(lpost)
+        est=np.asarray(getattr(Objective,'_est__'+estType)(jnp.asarray(lpost),st.Y))
+        w=np.asarray(st.weights)>0
+        Y=np.asarray(st.Y)
+        nCtg=len(Y)
+        best=np.argmax(lpost,axis=-1)
+        confusion=np.stack([np.bincount(best[w[:,c],c],minlength=nCtg) for c in range(nCtg)])
+        err=[est[w[:,c],c]-Y[c] for c in range(nCtg)]
+        correct=np.diagonal(lpost,axis1=-2,axis2=-1)
+        return {'Y':Y,
+                'estimates':est,
+                'bias':np.array([e.mean() for e in err]),
+                'sd':np.array([e.std() for e in err]),
+                'rmse':np.array([np.sqrt(np.mean(e**2)) for e in err]),
+                'pCorrect':np.diagonal(confusion)/confusion.sum(1),
+                'confusion':confusion,
+                'cost':float(-correct[w].mean())}
+
+    def cross_validate(self,n,k=5,seed=0,**train_kw):
+        """
+        k-fold cross-validation, stratified by category: train n new filters on each training fold with copies of this
+        unit's settings, and evaluate them on the held-out fold. Returns train and test costs [ k ] and filters [ k x ... ].
+        """
+        res={'train':[],'test':[],'filters':[]}
+        for i,(train,test) in enumerate(self.stim_full.folds(k,seed)):
+            unit=Unit(train,self.nrn.copy(),self.model.copy(),self.objective.copy(),
+                      optimizer=None if self.optimizer is None else self.optimizer.copy(),seed=self.seed+i)
+            unit.train_new(n,**train_kw)
+            res['train'].append(float(unit.loss))
+            res['test'].append(unit.evaluate(test))
+            res['filters'].append(np.asarray(unit.out))
+        return {key:np.array(val) for key,val in res.items()}
+
+    #- save/load
+    def save(self,fname):
+        """save settings, filters, optimizer state, random keys, and frozen whitening (not the stimuli) with pickle"""
+        if not self.nrn.bFinalized:
+            raise Exception('train (or finalize) the unit first')
+        asnp=lambda tree: None if tree is None else tree_util.tree_map(np.asarray,tree)
+        state={'version':1,
+               'nrn':_get_copy_dict(self.nrn,['filter','corrType','bAnalytic','bFinalized','bSplit','bFourier','dtype']),
+               'model':_get_copy_dict(self.model),
+               'objective':_get_copy_dict(self.objective),
+               'optimizer':None if self.optimizer is None else _get_copy_dict(self.optimizer,['loss_hist','tx']),
+               'finalize':dict(n=self.filter.n,dtype=np.dtype(self.nrn.dtype).name,bFourier=self.nrn.bFourier,
+                               bAnalytic=bool(self.nrn.bAnalytic),bSplit=self.nrn.bSplit),
+               'out':np.asarray(self.filter.out),
+               'last':asnp(self.filter.last),
+               'opt_state':asnp(self.opt_state),
+               'opt_param_shape':getattr(self,'_opt_param_shape',None),
+               'loss_hist':list(getattr(self.optimizer,'loss_hist',[])),
+               'restart_costs':self.restart_costs,
+               'seed':self.seed,
+               'rng':np.asarray(jxrandom.key_data(self.rng)),
+               'rng_last':None if self.rng_last is None else np.asarray(jxrandom.key_data(self.rng_last)),
+               'W':asnp(self.nrn._W)}
+        with open(fname,'wb') as fh:
+            pickle.dump(state,fh)
+
+    @classmethod
+    def load(cls,fname,stim):
+        """load a unit saved with Unit.save, with its training stimuli"""
+        with open(fname,'rb') as fh:
+            state=pickle.load(fh)
+        asjnp=lambda tree: None if tree is None else tree_util.tree_map(jnp.asarray,tree)
+        unit=cls(stim,Nrn(**state['nrn']),Model(**state['model']),Objective(**state['objective'],_bCopy=True),
+                 optimizer=None if state['optimizer'] is None else Optimizer(**state['optimizer']),
+                 seed=state['seed'],rng=jxrandom.wrap_key_data(state['rng']),
+                 rng_last=None if state['rng_last'] is None else jxrandom.wrap_key_data(state['rng_last']))
+        fin=state['finalize']
+        fourierType=(2 if fin['bAnalytic'] else 1) if fin['bFourier'] else 0
+        if unit.optimizer is None:
+            unit.optimizer=Optimizer()
+        unit._finalize(fin['n'],np.arange(fin['n']),fourierType=fourierType,bSplit=fin['bSplit'],dtype=jnp.dtype(fin['dtype']))
+        if state['optimizer'] is None:
+            unit.optimizer=None
+        unit.filter.out=jnp.asarray(state['out'])
+        unit.filter.last=asjnp(state['last'])
+        unit.opt_state=asjnp(state['opt_state'])
+        unit._opt_param_shape=state['opt_param_shape']
+        if unit.optimizer is not None:
+            unit.optimizer.loss_hist=state['loss_hist']
+        unit.restart_costs=state['restart_costs']
+        unit.nrn._W=asjnp(state['W'])
+        return unit
 
     #- whitening
     def freeze_whitening(self):
@@ -1815,6 +2022,14 @@ class Unit(_Static):
         noiseCov=self.nrn._corr_fun(RVar,stimweights,self.nrn.rho)
         noiseCorr=self.nrn.corr_matrix(R.shape[0],R.dtype) if self.nrn.corrType=='corr' else None
         return self.model.lrn_main(R,Rm,RVar,noiseCov,noiseCorr,stimweights)
+
+    def _likelihoods_heldout(self,obs_out,ref_out,refweights):
+        # observed responses of other stimuli, decoded against the reference (training) stimuli; no leave-one-out
+        R=_flatten_responses(self.model._response_fun(*obs_out)[0])
+        _,Rm,RVar=[_flatten_responses(x) for x in self.model._response_fun(*ref_out)]
+        noiseCov=self.nrn._corr_fun(RVar,refweights,self.nrn.rho)
+        noiseCorr=self.nrn.corr_matrix(R.shape[0],R.dtype) if self.nrn.corrType=='corr' else None
+        return self.model._model_fun(R,Rm,RVar,noiseCov,noiseCorr,refweights,False)
 
     @partial(jit, static_argnames=['self'])
     def _loss_fun_lrn(self,params,rng_key,prepped,index,stimval,stimweights,yCtg,Y):
