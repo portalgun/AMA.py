@@ -2999,8 +2999,11 @@ class Unit(_Static):
         flt=self.filter
         dims=tuple(flt.pix_dims)
         g=np.asarray(flt.implied_spatial())
-        if flt.bSplit:
-            g=g[...,0,:]
+        parts=None
+        if flt.bSplit:                                                    # one column per sub-filter (e.g. per eye)
+            nSp=int(flt.nSplit)
+            g=np.reshape(g,tuple(flt.pix_dims)+(-1,))
+            parts=np.tile(np.arange(nSp),g.shape[-1]//nSp) if g.shape[-1]%nSp==0 else None
         n=g.shape[-1]
         F=np.asarray(self.out).reshape(dims+(n,)) if flt.bIsFourier and not flt.bSplit else None
         w=None if self.pool_p is None else np.asarray(Nrn.pool_weights(np.asarray(self.pool_p,float).ravel()))
@@ -3028,7 +3031,7 @@ class Unit(_Static):
                 ax=fig.add_subplot(gs[m_,s_])
                 ax.plot(x,np.real(g[:,j]),lw=0.8,color=colors[m_],label='real')
                 ax.plot(x,np.imag(g[:,j]),lw=0.8,ls=':',color=colors[m_],label='quadrature')
-                ttl='f'+str(j)+(' m'+str(m_) if nM>1 else '')+kp(j)
+                ttl='f'+str(j)+(' m'+str(m_) if nM>1 else '')+('' if parts is None else ' part'+str(parts[j]))+kp(j)
                 if w is not None and w.size==n:
                     ttl+='\nw=%.2f'%w[j]
                 ax.set_title(ttl,fontsize=6)
@@ -3150,8 +3153,10 @@ class Unit(_Static):
         st=copy.copy(stim)
         if st.bIsFourier:
             st._ifft()
-        if self.filter.bSplit:
-            raise Exception('response embeddings are not implemented for split filters')
+        if self.filter.bSplit and not st.bIsSplit:
+            st.split()
+        elif st.bIsSplit and not self.filter.bSplit:
+            st.unsplit()
         rng=np.random.default_rng(seed)
         valid=np.asarray(st.weights)>0                                    # [ nStim_Ctg x nCtg ]
         per=max(1,nMax//st.nCtg)
@@ -3161,10 +3166,18 @@ class Unit(_Static):
             k=min(per,idx.size)
             cols.append(np.stack([rng.choice(idx,k,replace=False),np.full(k,c)],1))
         sel=np.concatenate(cols)
-        S=np.real(np.asarray(st.val).reshape(st.nPix,st.nStim_Ctg,st.nCtg)[:,sel[:,0],sel[:,1]])
         lat=np.asarray(st.Y)[sel[:,1]]
-        g=np.asarray(self.filter.implied_spatial()).reshape(st.nPix,-1)
-        r=g.T@S                                                           # [ nF x nStim ]
+        g=np.asarray(self.filter.implied_spatial())
+        if self.filter.bSplit:
+            # each sub-filter (e.g. one eye) responds as its own neuron: [ nSplit x nF ] response dimensions
+            nS=int(self.filter.nSplit)
+            nP=st.nPix//nS
+            g=g.reshape(nP,nS,-1)
+            S=np.real(np.asarray(st.val).reshape(nP,nS,st.nStim_Ctg,st.nCtg)[:,:,sel[:,0],sel[:,1]])
+            r=np.einsum('psj,psn->sjn',g,S).reshape(-1,S.shape[-1])
+        else:
+            S=np.real(np.asarray(st.val).reshape(st.nPix,st.nStim_Ctg,st.nCtg)[:,sel[:,0],sel[:,1]])
+            r=g.reshape(st.nPix,-1).T@S                                   # [ nF x nStim ]
         u=r/np.maximum(np.abs(r),1e-12) if self.nrn.normalizeType=='phase' else r
         feats=(np.concatenate([u.real,u.imag],0) if np.iscomplexobj(u) else u).T
         if cmap is None:

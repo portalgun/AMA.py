@@ -72,3 +72,16 @@ def test_embedding_methods_and_fourier_stimuli(tmp_path):
                                       method_kw={'tsne':{'perplexity':5}})
     assert (tmp_path/'two.png').exists() and [a.get_title() for a in fig.axes][:2]==['t-SNE','PHATE']
     assert fig._suptitle.get_text().startswith('both')
+
+
+def test_split_filters(tmp_path):
+    x,st,ci,Y,info=ts.binocular_shift()
+    stim=ama.Stim(x,st,ci,Y,nSplit=2)
+    unit=ama.Unit(stim,ama.Nrn(),ama.Model('gss','mean',covShrink=0.5),ama.Objective('map'),
+                  ama.Optimizer(nIterMax=5,bVerbose=False),name='disparity / gss')
+    unit.train_new(2,bSplit=True)
+    unit.save_figures(tmp_path/'s',stim,methods=('tsne',),nMax=60,perplexity=5)
+    assert (tmp_path/'s_filters.png').exists() and (tmp_path/'s_tsne.png').exists()
+    # each sub-filter is its own response dimension: 2 eyes x 2 filters
+    feats,u,lat,cmap=unit._response_features(stim,60,0)
+    assert u.shape[0]==4 and feats.shape[0]==lat.size
