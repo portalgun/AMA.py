@@ -26,7 +26,8 @@ For binocular images, filters can be split into sub-filters (one per eye).
 git clone https://github.com/portalgun/AMA.py
 git clone https://github.com/portalgun/Filter.py
 cd AMA.py
-pip install jax optax numpy scipy matplotlib scikit-learn pytest
+pip install jax optax numpy scipy matplotlib scikit-learn pyyaml pytest
+pip install pacmap phate                   # optional: PaCMAP and PHATE response embeddings
 export PYTHONPATH=$PWD/../Filter.py        # Filter.py is not pip-installable yet
 ```
 For NVIDIA GPUs, install `jax[cuda12]` instead of `jax`.
@@ -120,7 +121,8 @@ nrn=ama.Nrn(fano=1.36,             # fano factor
             nSamples=1,            # noise samples per response
             whitenType='None',     # population whitening before noise
             whitenMethod='zca',
-            whitenEps=1e-5)
+            whitenEps=1e-5,
+            readoutType='None')   # pooled readout with learned weights
 ```
 
 normalizeType - response normalization. See [Iyer & Burge 2019](https://jov.arvojournals.org/article.aspx?articleid=2755285) (2).
@@ -128,6 +130,12 @@ normalizeType - response normalization. See [Iyer & Burge 2019](https://jov.arvo
 - 'broad' - broadband: divide by the stimulus contrast energy, `||s||`
 - 'narrow' - narrowband: divide by the dot product of the stimulus and filter amplitude spectra, `A_s^T A_f`. Stimulus specific but feature independent (2). Requires fourier-domain learning.
 - 'gen' - divide by `eps + sum(|r|)` over the population
+- 'phase' - unit phasors `r/(|r|+eps)` (signs for real responses): contrast- and gain-invariant responses, the inputs of phase congruency. Most useful with quadrature pairs (fourierType=2).
+
+readoutType - pooling of the (normalized) responses across filters with learned nonnegative weights (softplus of `unit.pool_p`, normalized to sum to 1), before stage-2 noise:
+- 'None'
+- 'resultant' - the filter responses plus their weighted resultant `sum_j p_j R_j`
+- 'resultant_only' - only the weighted resultant; with `normalizeType='phase'` this is weighted phase congruency, decoded by the likelihood
 
 activationType - 'None', 'relu', 'softplus', 'abs', 'logistic', 'swish', 'swish2', 'tanh', 'gauss', 'igauss' (applied to real and imaginary parts separately)
 
@@ -159,12 +167,24 @@ The likelihood of the responses given each level of the latent variable
 ```python
 model=ama.Model(modelType='gss',       # likelihood model
                 responseType='basic',  # which responses are decoded
-                bLeaveOneOut=False)    # full AMA: leave each decoded stimulus out of its own category
+                bLeaveOneOut=False,    # full AMA: leave each decoded stimulus out of its own category
+                covShrink=0.,          # shrink category covariances toward covTarget (0-1)
+                covTarget='diag',      # 'diag' or 'pooled'
+                df=5.,                 # degrees of freedom for modelType='student'
+                ctgPoolWidth=None,     # pool category statistics over neighbouring Y (kernel width in units of Y)
+                bPoolMeans=False,      # also pool the category means
+                circMean='estimate')   # modelType='circ': 'estimate' or 'zero' (unknown complex gain)
 ```
 
 modelType
 - 'gss' - AMA-Gauss: the responses to each category are gaussian, with the mean and covariance of the category's mean responses plus the noise covariance (Jaini & Burge 2017)
 - 'full' - the original AMA: each category's likelihood is the average over its stimuli of the noisy response distribution to each stimulus (Burge & Jaini 2017, Eq 5)
+- 'student' - as 'gss', with a multivariate student t of `df` degrees of freedom (df > 2) whose covariance matches the category covariance plus noise: heavy tails, as natural-image responses have
+- 'circ' - a circular (proper) complex gaussian on quadrature-pair responses (fourierType=2, no whitening): hermitian category covariances, so half the parameters of 'gss' on the real and imaginary parts, and circular symmetry built in. With `circMean='zero'` the category mean is fixed at zero and the covariance is the second moment `E[R R^H]`: the likelihood when each stimulus's complex gain (contrast and phase, e.g. edge polarity or feature type) is unknown, `R = G m + noise`
+
+Category statistics ('gss', 'student', 'circ'):
+- covShrink, covTarget - each category covariance becomes `(1-covShrink) Sigma + covShrink T`, with T its own diagonal ('diag') or the count-weighted mean covariance over categories ('pooled'), before the noise covariance is added. Stabilizes covariances estimated from few stimuli per response dimension.
+- ctgPoolWidth - each category's covariance is the scatter pooled over categories with gaussian weights `exp(-(Y_i-Y_k)^2/(2 w^2))` (times the counts): for latent variables whose response statistics change smoothly (e.g. position, disparity). `bPoolMeans` pools the means too, which biases them toward their neighbours.
 
 responseType
 - 'mean' - decode mean responses (noise enters through the likelihood)
@@ -178,7 +198,9 @@ With `bLeaveOneOut=True`, the posterior is Eq 5 with the decoded stimulus remove
 objective=ama.Objective(errType='map',   # error
                         bPosterior=None, # decode the posterior (default for all but 'mle')
                         estType=None,    # estimator for 'l1' and 'l2'
-                        lossType='mean') # how errors are combined
+                        lossType='mean', # how errors are combined
+                        regType='None',  # filter penalty while training
+                        regWeight=0.)    # its weight
 ```
 
 errType
@@ -191,6 +213,11 @@ estType - 'mean', 'median', 'mode' (MAP; no gradient), or 'cmean' (circular mean
 
 lossType - 'mean' or 'median' over the valid stimuli
 
+regType - a penalty on the learned filter coefficients, added to the cost during training as `regWeight` times its mean over filters (not included in `unit.loss`; see `unit.penalty`). It acts in the learning domain:
+- 'None'
+- 'l1' - `sum |f|`: sparse filters, or sparse spectra when learning in the fourier domain
+- 'smooth' - summed squared differences between neighbouring learned coefficients: smooth spatial filters, or smooth spectra (compact spatial support) in the fourier domain
+
 ### Optimizer
 ```python
 optimizer=ama.Optimizer(optimizerType='adam',            # optax algorithm
@@ -201,7 +228,8 @@ optimizer=ama.Optimizer(optimizerType='adam',            # optax algorithm
                         batchSize=None,                  # stimuli per iteration (None = all)
                         nStepsPerChunk=100,              # iterations compiled together
                         bVerbose=True,                   # print the loss after each chunk
-                        nBatchMinCtg=2)                  # minimum stimuli per category in a batch
+                        nBatchMinCtg=2,                  # minimum stimuli per category in a batch
+                        patience=None)                   # early stopping (with stimVal)
 ```
 
 optimizerType - any optimizer in the [optax documentation](https://optax.readthedocs.io/en/latest/api/optimizers.html).
@@ -221,10 +249,13 @@ With batches, `optimizer.loss_hist` holds batch costs, which are noisy; use `uni
 
 nStepsPerChunk - iterations compiled into a single `lax.scan`.
 
+patience - early stopping. When training is given validation stimuli (`unit.train_new(n,stimVal=val)`, also `train_append`, `train_recurse`, `train_parametric`), the cost on them is computed after every chunk (`optimizer.val_hist`), training stops after `patience` chunks without improvement (None: never stops early), and the filters with the lowest validation cost are kept (`optimizer.best_step`).
+
 ### Unit
 ```python
-unit=ama.Unit(stim,nrn,model,objective,optimizer=None,seed=None)
+unit=ama.Unit(stim,nrn,model,objective,optimizer=None,seed=None,name=None)
 ```
+`name` labels the unit (used as the title of its figures, kept by `save`/`load` and written to the yaml configuration).
 
 #### Learning
 ```python
@@ -242,6 +273,37 @@ unit.train_recurse(ind_rec=None,...)
 ```
 Continue learning the current filters (or only those in `ind_rec`).
 
+All three accept `stimVal` for early stopping (see Optimizer `patience`).
+
+```python
+unit.train_parametric(n,family='morse',fourierType=2,bTied=True,orientations=None,init=None,stimVal=None)
+```
+Learn a parametric filter bank instead of free filters, in the fourier domain (1D or 2D stimuli, not split):
+- family 'morse' - generalized Morse spectra `(k/kp)^b exp((b/gamma)(1-(k/kp)^gamma))`, whose low-frequency power-law rise (b) and high-frequency fall (gamma) are learned
+- family 'loggabor' - `exp(-log(k/kp)^2/(2 sigma_u^2))`
+- 2D stimuli: times a one-sided gaussian angular profile (width sigma_theta) around each filter's orientation (`orientations`, radians from the first stimulus axis)
+- bTied - filters are dilations of one mother filter, peaks `kTop/ratio^j`, sharing its shape; otherwise each filter has its own peak and shape
+- init - starting values: kTop (cycles per sample), ratio, gamma, b, sigma_u, sigma_theta
+
+The learned filters become ordinary filters (`unit.out`), so evaluation, saving, and `train_recurse` (free refinement from the parametric solution) work as usual. `unit.parametric_values()` returns the parameters (peak frequencies, ratio, shapes, orientations).
+
+```python
+unit.train_multiscale(n,fourierType=2,nKnot=25,uWidth=2.5,scaleType='tied',kTop=0.25,ratio=2.0,kPeak=None,
+                      orientations=None,nKnotTheta=13,knotSmooth=0.,init='loggabor',stimVal=None,
+                      nScales=None,nOrientations=None,bInterleave=False,nMothers=1,motherInitNoise=0.1,edgeTaper=0.)
+```
+Learn a non-parametric multiscale filter bank: every filter is a copy of one learned mother filter, dilated (shifted in log frequency to its peak frequency) and, for 2D stimuli, rotated (shifted in angle to its orientation). The mother filter has no functional form: complex spectrum values at `nKnot` points uniform over `log(k/k_peak)` in `[-uWidth, uWidth]` (2D: a `nKnot x nKnotTheta` grid over log radius and angle in `[-pi/2, pi/2]`), linearly interpolated and zero outside. Filters are unit norm, in the fourier domain (1D or 2D stimuli, not split).
+- scaleType - 'tied' (peaks `kTop/ratio^j`, kTop and ratio learned), 'fixed' (peaks `kPeak`, not learned), or 'free' (a learned peak per filter)
+- knotSmooth - weight of a penalty on squared second differences of the mother's knot values, relative to its energy
+- init - initial mother: 'loggabor' (a log-gaussian bump) or 'random'
+- nScales, nOrientations - 2D: build the bank as a grid (n need not be given): peaks `kTop/ratio^j`, j = 0..nScales-1, at orientations `o*pi/nOrientations`, o = 0..nOrientations-1 (wrapped to (-pi/2, pi/2]), `n = nScales*nOrientations`; `kPeak` and `orientations` are then set by the grid
+- bInterleave - with the grid: add an interleaved grid of the same size (`n = 2*nScales*nOrientations`) at the tritones, half a scale step (peaks `/sqrt(ratio)`) and half a rotation step (`+pi/(2*nOrientations)`) from the primary grid, sharing the same mother filter. With scaleType='tied' the interleaved scales stay halfway in log frequency as the ratio is learned. Filter order: the primary grid (scale first), then the interleaved grid; `multiscale_values()` adds `scale_step`, `nScales`, `nOrientations`, `bInterleave`, and an `interleaved` mask
+- nMothers - learn this many mother filters simultaneously. Every mother gets the same scale (and orientation) filters, so the bank has `nMothers * n` filters, ordered mother first; scales and orientations are shared. `n` (or the grid) counts the filters per mother. `multiscale_values()` then returns `mother` as `[ nMothers x nKnot (x nKnotTheta) ]`, per-filter `k_peak`, `scale_step` and `orientations`, and `mother_index`
+- edgeTaper - force each mother to vanish at the ends of its log-frequency support: its knots are multiplied by a fixed window rising (cosine) from 0 at the outermost knots to 1 over this fraction of the knot range at each end (0 = none; 0.2 tapers 5 of 25 knots per end). Without it a mother can move its energy to the edge of the support, so its dilated copies become narrowband filters cut off at the boundary. The reported mother, the filters and `knotSmooth` use the tapered knots; in 2D the taper is along log radius only
+- motherInitNoise - with `nMothers > 1`, independent complex gaussian noise of this size (relative to the initial bump) added to each mother's initial knots; identical mothers would get identical gradients and never diverge
+
+As with `train_parametric`, the filters become ordinary filters; `unit.multiscale_values()` returns the mother filter (`mother`, `log_freq_knots`, `angle_knots`) and the scales (`k_peak`, `ratio`). This learns the shape of a dilation-invariant bank from the task, without assuming log-Gabor, Morse, or any other family.
+
 fourierType
 - 0 = spatial (or spatio-temporal) domain
 - 1 = fourier domain: one real filter per learned filter
@@ -257,6 +319,20 @@ dtype - float32 (default) or float64; complex64 (default) or complex128 in the f
 
 bSplit - split filters into one sub-filter per part of the stimulus (set `nSplit` in `Stim`, e.g. 2 for the two eyes). Each sub-filter responds as its own neuron.
 
+#### Configuration files (yaml)
+Every call to `train_new`, `train_recurse`, `train_append`, `train_parametric` and `train_multiscale` is recorded (method and all arguments, defaults included) in `unit.train_log`, which `save` / `load` keep.
+- `unit.config()` - the unit's options and settings as a plain dict: `nrn`, `model`, `objective` and `optimizer` settings, `seed`, the filter layout (`filters`: n, fourierType, dtype, shape, whether it has pooling weights), a summary of the training stimuli (`stim`), and the training calls (`train`). Learned filters are not included (use `save`).
+- `unit.save_config('unit.yaml')` - write it as yaml
+- `ama.Unit.from_config('unit.yaml', stim, bTrain=False, stimVal=None)` - build a unit from a yaml file (or dict) with these stimuli; `bTrain=True` replays the recorded training calls, passing `stimVal` to the calls that had validation stimuli. Unknown top-level keys (e.g. project metadata) are ignored
+- `ama.config_from_saved('unit.pkl')` - the configuration of a saved unit, without loading stimuli
+- `ama.load_config('unit.yaml')` - read a configuration file
+- `ama.source_sha256()` - hash of the `ama.py` source; configs and saved units record it (`ama_source_sha256`), since optimization paths can differ numerically between code versions
+
+```python
+unit.save_config('unit.yaml')                                   # after training
+same=ama.Unit.from_config('unit.yaml', stim, bTrain=True, stimVal=stimVal)
+```
+
 #### Evaluation
 - `unit.loss` - cost on the training stimuli
 - `unit.evaluate(stim)` - cost on other stimuli, decoded with the training set: category response distributions (AMA-Gauss), reference stimuli (full AMA), prior, and whitening all come from the training stimuli
@@ -271,12 +347,22 @@ bSplit - split filters into one sub-filter per part of the stimulus (set `nSplit
 ```python
 unit.save('unit.pkl')                       # settings, filters, optimizer state, random keys (not the stimuli)
 unit=ama.Unit.load('unit.pkl',train_stim)   # training continues identically
+unit.save_config('unit.yaml')               # the settings and training calls alone (see Configuration files)
 ```
+`save` also keeps the unit's `name`, its `train_log` (the training calls), the bank metadata of `train_multiscale` /
+`train_parametric` (so `multiscale_values()` / `parametric_values()` work after `load`), the pooling weights, and
+`ama.source_sha256()`, the hash of the `ama.py` that trained it.
 
 #### Properties
 - `unit.out` - learned filters
 - `unit.last` - filters before the last `train_append`/`train_recurse`
+- `unit.pool_p` - pooling-weight parameters of a readout (weights: `ama.Nrn.pool_weights(unit.pool_p)`)
+- `unit.penalty` - the current filters' regType penalty
 - `unit.filter.implied_spatial()` - spatial filters implied by fourier-domain filters
+- `unit.multiscale_values()` / `unit.parametric_values()` - the learned bank: mother filter(s), peak frequencies, ratio,
+  orientations, and (with a grid) `nScales`, `nOrientations`, `bInterleave`, `nMothers`, `edgeTaper`
+- `unit.train_log` - the training calls made so far (method and all arguments), the basis of `config()`
+- `unit.name` - the unit's label
 
 #### Plotting
 ```python
@@ -285,6 +371,19 @@ unit.plot_last()                   # previous filters
 unit.responses.plot_marginal()     # response distributions per category
 unit.responses.plot_joint()        # joint responses of filter pairs
 unit.responses.plot_tsne()         # t-SNE of the population responses
+unit.plot_filter_bank('bank.png')                  # filters, log and linear amplitude spectra, pooling weights, mother filter(s)
+unit.plot_response_embedding(test_stim, 'tsne', 'tsne.png')   # t-SNE of the filter responses to (held-out) stimuli + pooled resultant
+unit.plot_response_embedding(test_stim, 'pacmap')  # or PaCMAP / PHATE (plot_response_tsne / _pacmap / _phate are shortcuts)
+unit.plot_response_embeddings(test_stim)           # all three in one figure (+ the pooled resultant), same responses
+unit.save_figures('run/stage', test_stim)          # run/stage_filters.png, _{tsne,pacmap,phate}.png and _embeddings.png
+#   methods=('tsne',) or methods={'tsne': {'perplexity': 20}, 'phate': {}} for per-method options
+```
+Embeddings need scikit-learn (t-SNE), `pacmap` (PaCMAP) and `phate` (PHATE).
+`ama.Unit(..., name='mixed amplitude / natural / phase pooled')` labels a unit: the name titles its figures (or pass `name=` to a
+plotting call), and is kept by `save` / `load` and in the yaml configuration. `save` / `load` also keep the bank metadata of
+`train_multiscale` / `train_parametric`, so `multiscale_values()` works on loaded units. `plot_filter_bank(bankInfo=...)` takes
+that metadata for units saved without it.
+```python
 stim.plot()                        # a stimulus
 ```
 
@@ -315,8 +414,9 @@ See the tests in `tests/` for reference implementations of the math.
 
 V2
 - learn normalization indices?
-- weights and combination learning (no likelihoods?)
+- weights and combination learning beyond the pooled resultant (readoutType)
 - specified noise covariance
+- low-rank (signal plus noise) category covariances for 'circ'
 - layers
 
 

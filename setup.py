@@ -13,6 +13,7 @@ setup(
         'jax>=0.4.35',
         'scikit-learn>=1.5',
         'matplotlib>=3.9.2',
-        'scipy>=1.14.1'
+        'scipy>=1.14.1',
+        'PyYAML>=6.0'
     ]
 )
