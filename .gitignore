@@ -3,3 +3,6 @@ __pycache__/
 cProfile
 _old/
 .ipynb_checkpoints/
+*.ipynb
+profile_output
+.jax_profile/
