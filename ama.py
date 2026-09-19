@@ -3154,6 +3154,7 @@ class Unit(_Static):
         if st.bIsFourier:
             st._ifft()
         if self.filter.bSplit and not st.bIsSplit:
+            st.nSplit=int(self.filter.nSplit)                              # stimuli built without nSplit: the filters know it
             st.split()
         elif st.bIsSplit and not self.filter.bSplit:
             st.unsplit()
