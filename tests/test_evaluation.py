@@ -243,3 +243,25 @@ def test_save_load_roundtrip_and_resume(tmp_path,gen,nrn_kw,train_kw):
     for u in (unit,loaded):
         u.train_recurse()
     assert np.allclose(np.asarray(loaded.out),np.asarray(unit.out))
+
+
+class TestNoisyPerformance:
+    """performance / estimates with noisy observations use the same nNoiseSamples draws as loss and evaluate"""
+
+    @pytest.mark.parametrize('modelType',['gss','full'])
+    def test_cost_equals_the_averaged_costs(self,modelType):
+        x,s,ci,Y,_=ts.unequal_counts(counts=(12,30,20))
+        train,test=ama.Stim(x,s,ci,Y).train_test(0.3,seed=0)
+        unit=unit_from(train,ama.Nrn(bNoise_2=True),modelType,responseType='basic')
+        unit.model=ama.Model(modelType,'basic',nNoiseSamples=4)
+        unit._set_geometry()
+        assert np.isclose(unit.performance(stim=test)['cost'],unit.evaluate(test),rtol=1e-9)
+        assert np.isclose(unit.performance()['cost'],float(unit.loss),rtol=1e-9)
+        perf=unit.performance('mean',stim=test)
+        est=unit.estimates('mean',test)
+        assert est.shape[0]==4 and np.allclose(perf['estimates'],est)
+        assert np.array_equal(perf['confusion'].sum(1),4*np.asarray(test.weights).sum(0))
+        # one draw: as before
+        unit.model=ama.Model(modelType,'basic')
+        unit._set_geometry()
+        assert np.isclose(unit.performance(stim=test)['cost'],unit.evaluate(test),rtol=1e-9)

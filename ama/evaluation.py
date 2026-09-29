@@ -59,16 +59,23 @@ class _Evaluation:
         return float(self._loss_fun_heldout(self._params_out(),self.rng,test.val,test.weights,test.yCtg,test.Y,
                                             self.stim.val,self.stim.weights,self.stim.yCtg))
 
-    def _log_posterior(self,stim=None):
-        # (log posterior, the decoded Stim, the within-category values Yc or None)
+    def _noise_keys(self):
+        # the keys of the noisy observations that loss and evaluate average (Unit._noise_average): one without nNoiseSamples
+        S=self.model.nNoiseSamples
+        return [self.rng] if S<=1 else list(jxrandom.split(self.rng,S))
+
+    def _log_posterior(self,stim=None,key=None):
+        # (log posterior, the decoded Stim, the within-category values Yc or None) of one noise draw (key)
+        key=self.rng if key is None else key
         f=self.filter.out_flat
         if stim is None:
-            lAll,Yc=self._lik_parts(self._likelihoods(self._nrn_out(),self.stim.weights,self.stim.Y,yRef=self._yRef(self.stim.yCtg)))
+            out=self.nrn.main(key,self.stim.val,f,self.stim.weights,self.nrn._W,self._p())
+            lAll,Yc=self._lik_parts(self._likelihoods(out,self.stim.weights,self.stim.Y,yRef=self._yRef(self.stim.yCtg)))
             return Objective._posterior__true(lAll,self.stim.weights),self.stim,Yc
         test=self._prepare_stim(stim)
         W=self.nrn.whitening(self.stim.val,f,self.stim.weights) if self.nrn._bWhiten else None
-        ref,G=self.nrn.main(self.rng,self.stim.val,f,self.stim.weights,W,self._p(),bWithGain=True)
-        obs=self.nrn.main(self.rng,test.val,f,test.weights,W,self._p(),G)
+        ref,G=self.nrn.main(key,self.stim.val,f,self.stim.weights,W,self._p(),bWithGain=True)
+        obs=self.nrn.main(key,test.val,f,test.weights,W,self._p(),G)
         lAll,Yc=self._lik_parts(self._likelihoods_heldout(obs,ref,self.stim.weights,self.stim.Y,self._yRef(self.stim.yCtg)))
         return Objective._posterior__true(lAll,self.stim.weights),test,Yc
 
@@ -78,11 +85,15 @@ class _Evaluation:
         training stimuli, or for other stimuli decoded with the training set: 'mode' (MAP), 'mean' (MMSE; circular on
         circular dimensions), 'median', or 'cmean' (circular mean, Y in radians). With Model bWithin, continuous
         estimates within the categories. model: decode with this Model instead of the unit's (see evaluate). With
-        noisy observations (responseType 'basic'), one noise draw (the unit's key), not the nNoiseSamples average of loss
-        and evaluate
+        noisy observations (responseType 'basic') and nNoiseSamples S > 1, the estimates of the same S draws as loss and
+        evaluate, stacked on a first axis [ S x ... ]
         """
-        lpost,st,Yc=self._decoder(model)._log_posterior(stim)
-        return np.asarray(getattr(Objective,'_est__'+estType)(lpost,st.Y,st.Yperiod,Yc))
+        u=self._decoder(model)
+        est=[]
+        for key in u._noise_keys():
+            lpost,st,Yc=u._log_posterior(stim,key)
+            est.append(np.asarray(getattr(Objective,'_est__'+estType)(lpost,st.Y,st.Yperiod,Yc)))
+        return est[0] if len(est)==1 else np.stack(est)
 
     def performance(self,estType='mode',stim=None,model=None):
         """
@@ -91,29 +102,35 @@ class _Evaluation:
         stimuli (rmseAll); pCorrect and confusion [ true x MAP category ] of the MAP category; and cost, the mean -log
         posterior at the correct level. Errors are measured from each stimulus's own latent value (Stim y), which for
         stimuli without their own values is their category's level. model: decode with this Model instead of the unit's
-        (see evaluate). With noisy observations (responseType 'basic'), one noise draw (the unit's key): its cost is not
-        the nNoiseSamples average of loss and evaluate
+        (see evaluate). With noisy observations (responseType 'basic') and nNoiseSamples S > 1, over the same S draws as
+        loss and evaluate (so cost equals them): errors and MAP categories of every draw pooled (confusion counts S per
+        stimulus), and estimates [ S x ... ]
         """
-        lpost,st,Yc=self._decoder(model)._log_posterior(stim)
-        lpost=np.asarray(lpost)
-        est=np.asarray(getattr(Objective,'_est__'+estType)(jnp.asarray(lpost),st.Y,st.Yperiod,Yc))
-        w=np.asarray(st.weights)>0
-        Y=np.asarray(st.Y)
-        y=np.asarray(st.yCtg)
-        nCtg=len(Y)
-        best=np.argmax(lpost,axis=-1)
-        confusion=np.stack([np.bincount(best[w[:,c],c],minlength=nCtg) for c in range(nCtg)])
-        err=[np.asarray(_wrap(jnp.asarray(est[w[:,c],c]-y[w[:,c],c]),st.Yperiod)) for c in range(nCtg)]
-        correct=np.diagonal(lpost,axis1=-2,axis2=-1)
-        return {'Y':Y,
-                'estimates':est,
+        u=self._decoder(model)
+        ests,errs,confs,costs=[],[],[],[]
+        for key in u._noise_keys():
+            lpost,st,Yc=u._log_posterior(stim,key)
+            lpost=np.asarray(lpost)
+            est=np.asarray(getattr(Objective,'_est__'+estType)(jnp.asarray(lpost),st.Y,st.Yperiod,Yc))
+            w=np.asarray(st.weights)>0
+            y=np.asarray(st.yCtg)
+            nCtg=len(np.asarray(st.Y))
+            best=np.argmax(lpost,axis=-1)
+            confs.append(np.stack([np.bincount(best[w[:,c],c],minlength=nCtg) for c in range(nCtg)]))
+            errs.append([np.asarray(_wrap(jnp.asarray(est[w[:,c],c]-y[w[:,c],c]),st.Yperiod)) for c in range(nCtg)])
+            costs.append(-np.diagonal(lpost,axis1=-2,axis2=-1)[w].mean())
+            ests.append(est)
+        err=[np.concatenate([e[c] for e in errs]) for c in range(nCtg)]
+        confusion=sum(confs)
+        return {'Y':np.asarray(st.Y),
+                'estimates':ests[0] if len(ests)==1 else np.stack(ests),
                 'bias':np.array([e.mean(0) for e in err]),
                 'sd':np.array([e.std(0) for e in err]),
                 'rmse':np.array([np.sqrt(np.mean(e**2,0)) for e in err]),
                 'rmseAll':np.sqrt(np.mean(np.concatenate(err)**2,0)),
                 'pCorrect':np.diagonal(confusion)/confusion.sum(1),
                 'confusion':confusion,
-                'cost':float(-correct[w].mean())}
+                'cost':float(np.mean(costs))}
 
     def cross_validate(self,n,k=5,seed=0,**train_kw):
         """
