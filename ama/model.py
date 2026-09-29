@@ -448,6 +448,83 @@ class Model(_Static):
         return q,logdet
 
     @staticmethod
+    def _loo_pooled_low_rank(m):
+        # whether leave-one-out with statistics shared across categories (_loo_needs_all) can use _loo_quad_all
+        return (Model._loo_needs_all(m) and m.covRank is None and not (m.covShrink>0 and m.covTarget=='diag')
+                and not (m.ctgPoolWidth is not None and m.bPoolMeans))
+
+    @staticmethod
+    def _loo_quad_all(R,Rm,noiseCov,noiseL,weights,m,Y,bCentered=True):
+        """
+        q = x^H M^-1 x and log det M [ nStim_Ctg x nCtg(k) x nCtg(i) ] of every category's likelihood with stimulus (l,k)
+        left out, when that changes the other categories' statistics (ctgPoolWidth without bPoolMeans, the pooled
+        shrinkage target; not covRank). Category i's covariance is (1-s) P_i/Q_i + s T + noise_i, with P_i = sum_j K_ij C_j
+        over the categories' own scatters, Q_i = sum_j K_ij dof_j, and T = sum_j C_j / sum_j dof_j. Leaving out a stimulus
+        of weight 1 from category k downdates C_k by c d d^H (d = Rm - o_k, c = N_k/(N_k-1) about the mean) and dof_k by 1,
+        so M = B_ik - a_ik d d^H with
+            B_ik = (1-s) P_i/(Q_i-K_ik) + s sum_j C_j/(D-1) + noise_i,   a_ik = c_k ((1-s) K_ik/(Q_i-K_ik) + s/(D-1)),
+        one matrix per pair of categories instead of one per stimulus and category; q and log det M follow from B's
+        Cholesky factor as in _loo_quad. noiseL [ nStim_Ctg x nCtg x nF x nF ] (bLooNoise): the own category's noise
+        covariance without the stimulus, which is not a low-rank change, so the own category's term is computed directly.
+        Stim weights are 0 (padding, whose value is ignored) or 1.
+        """
+        nF,_,nC=Rm.shape
+        noiseCov=jnp.broadcast_to(noiseCov,(nC,nF,nF))
+        wc=jnp.sum(weights,axis=0)                                               # [ nCtg ]
+        o=jnp.sum(Rm*weights,axis=1)/wc if bCentered else jnp.zeros((nF,nC),dtype=Rm.dtype)   # [ nF x nCtg ]
+        Dv=(Rm-o[:,None,:])*jnp.sqrt(weights)
+        C=jnp.einsum('isc,jsc->cij',Dv,jnp.conj(Dv))                             # [ nCtg x nF x nF ] own scatters
+        dof=(wc-1) if bCentered else wc
+        K=jnp.eye(nC,dtype=weights.dtype) if m.ctgPoolWidth is None else Model._ctg_kernel(Y,m.ctgPoolWidth,m._Yperiod).astype(weights.dtype)
+        s=m.covShrink                                                            # the pooled target (see _loo_pooled_low_rank)
+        QL=(K@dof)[:,None]-K                                                     # [ i x k ]
+        DL=jnp.sum(dof)-1
+        B=((1-s)*jnp.einsum('ij,jfg->ifg',K,C)[:,None]/QL[...,None,None] + s*jnp.sum(C,axis=0)/DL
+           + noiseCov.astype(C.dtype)[:,None])                                   # [ i x k x nF x nF ]
+        c=wc/(wc-1) if bCentered else jnp.ones_like(wc)
+        a=c[None,:]*((1-s)*K/QL + s/DL)                                          # [ i x k ]
+
+        d=jnp.transpose(Rm-o[:,None,:],(2,0,1))                                  # [ k x nF x l ]
+        eye=jnp.eye(nC,dtype=weights.dtype)
+        x=jnp.transpose(R,(2,0,1))[None]-o.T[:,None,:,None]                       # [ i x k x nF x l ]: R - o_i
+        if bCentered:
+            # the own category's mean without the stimulus: o_k - w d/(N_k-w)
+            x=x+eye[:,:,None,None]*(d*(weights/(wc-weights)).T[:,None,:])[None]
+        L=jnp.linalg.cholesky(B)
+        solve=lambda v: lax.linalg.triangular_solve(L,v,left_side=True,lower=True)
+        u,z=solve(jnp.broadcast_to(d[None],x.shape)),solve(x)
+        aw=a[...,None]*weights.T[None]                                           # [ i x k x l ]: 0 for padding
+        uu=jnp.sum(jnp.abs(u)**2,axis=2)
+        den=1-aw*uu
+        q=jnp.sum(jnp.abs(z)**2,axis=2)+aw*jnp.abs(jnp.sum(jnp.conj(u)*z,axis=2))**2/den
+        logdet=2*jnp.sum(jnp.log(jnp.real(jnp.diagonal(L,axis1=-2,axis2=-1))),axis=-1)[...,None]+jnp.log(den)
+        q,logdet=jnp.transpose(q,(2,1,0)),jnp.transpose(logdet,(2,1,0))           # [ l x k x i ]
+        if noiseL is not None:
+            k=jnp.arange(nC)
+            dl=jnp.transpose(d,(2,0,1))                                          # [ l x k x nF ]
+            M=(B[k,k]-noiseCov.astype(C.dtype))[None] + noiseL.astype(C.dtype) \
+              - aw[k,k].T[...,None,None]*dl[...,:,None]*jnp.conj(dl)[...,None,:]
+            xo=jnp.transpose(x[k,k],(2,0,1))                                     # [ l x k x nF ]
+            Lo=jnp.linalg.cholesky(M)
+            y=lax.linalg.triangular_solve(Lo,xo[...,None],left_side=True,lower=True)[...,0]
+            qo=jnp.sum(jnp.abs(y)**2,axis=-1)
+            ldo=2*jnp.sum(jnp.log(jnp.real(jnp.diagonal(Lo,axis1=-2,axis2=-1))),axis=-1)
+            q,logdet=Model._set_own(q,qo),Model._set_own(logdet,ldo)
+        return q,logdet
+
+    @staticmethod
+    def _lpdf_quad(q,logdet,n,m):
+        # log density from q = x^H M^-1 x and log det M of the covariance M (n dimensions; complex ones for 'circ')
+        if m.modelType=='student':
+            # scale (df-2)/df M: q scales by df/(df-2), log det by n log((df-2)/df)
+            df=m.df
+            return (jax.scipy.special.gammaln((df+n)/2)-jax.scipy.special.gammaln(df/2)-n/2*np.log(df*np.pi)
+                    -(logdet+n*np.log((df-2)/df))/2-(df+n)/2*jnp.log1p(q/(df-2)))
+        if m.modelType=='circ':
+            return -q-n*np.log(np.pi)-logdet
+        return -q/2-n/2*np.log(2*np.pi)-logdet/2
+
+    @staticmethod
     def _noise_all(noiseCov,noiseL):
         # [ nStim_Ctg x nCtg(k) x nCtg(i) x nF x nF ]: the left-out noise for the own category (i = k), else the category's
         eye=jnp.eye(noiseCov.shape[0],dtype=bool)[None,:,:,None,None]
@@ -491,13 +568,17 @@ class Model(_Static):
 
         x=jnp.transpose(R,(1,2,0))[:,:,None,:] - mu.T[None,None,:,:]         # [ nStim_Ctg x nCtg x nCtg x nF ]
         lAll=lmvn0(x,cov[None,None])
-        if bLeaveOneOut and Model._loo_needs_all(m):
+        if bLeaveOneOut and Model._loo_pooled_low_rank(m):
+            q,logdet=Model._loo_quad_all(R,Rm,noiseCov,Model._noise_loo(noiseCov,RVar,weights) if m.bLooNoise else None,
+                                         weights,m,Y)
+            lAll=Model._add_own(Model._lpdf_quad(q,logdet,R.shape[0],m),Model._loo_prior(weights))
+        elif bLeaveOneOut and Model._loo_needs_all(m):
             muL,covL=Model._ctg_stats_loo_all(Rm,weights,m,Y)
             noiseL=Model._noise_all(noiseCov,Model._noise_loo(noiseCov,RVar,weights,m))
             lAll=Model._add_own(lmvn0(jnp.transpose(R,(1,2,0))[:,:,None,:]-muL,covL+noiseL),Model._loo_prior(weights))
         elif bLeaveOneOut and Model._loo_rank_one(m):
             q,logdet=Model._loo_quad(R,Rm,noiseCov,weights)
-            lAll=Model._set_own(lAll,-q/2-R.shape[0]/2*np.log(2*np.pi)-logdet/2 + Model._loo_prior(weights))
+            lAll=Model._set_own(lAll,Model._lpdf_quad(q,logdet,R.shape[0],m) + Model._loo_prior(weights))
         elif bLeaveOneOut:
             muL,covL=Model._ctg_stats_loo(Rm,weights,m)
             noiseL=Model._noise_loo(noiseCov,RVar,weights,m)
@@ -511,18 +592,18 @@ class Model(_Static):
         scale=(cov + noiseCov)*(m.df-2)/m.df
         x=jnp.transpose(R,(1,2,0))[:,:,None,:] - mu.T[None,None,:,:]
         lAll=lmvt0(x,scale[None,None],m.df)
-        if bLeaveOneOut and Model._loo_needs_all(m):
+        if bLeaveOneOut and Model._loo_pooled_low_rank(m):
+            q,logdet=Model._loo_quad_all(R,Rm,noiseCov,Model._noise_loo(noiseCov,RVar,weights) if m.bLooNoise else None,
+                                         weights,m,Y)
+            lAll=Model._add_own(Model._lpdf_quad(q,logdet,R.shape[0],m),Model._loo_prior(weights))
+        elif bLeaveOneOut and Model._loo_needs_all(m):
             muL,covL=Model._ctg_stats_loo_all(Rm,weights,m,Y)
             noiseL=Model._noise_all(noiseCov,Model._noise_loo(noiseCov,RVar,weights,m))
             lAll=Model._add_own(lmvt0(jnp.transpose(R,(1,2,0))[:,:,None,:]-muL,(covL+noiseL)*(m.df-2)/m.df,m.df),
                                 Model._loo_prior(weights))
         elif bLeaveOneOut and Model._loo_rank_one(m):
-            # scale (df-2)/df M: q scales by df/(df-2), log det by nF log((df-2)/df)
             q,logdet=Model._loo_quad(R,Rm,noiseCov,weights)
-            n,df=R.shape[0],m.df
-            lt=(jax.scipy.special.gammaln((df+n)/2)-jax.scipy.special.gammaln(df/2)-n/2*np.log(df*np.pi)
-                -(logdet+n*np.log((df-2)/df))/2-(df+n)/2*jnp.log1p(q/(df-2)))
-            lAll=Model._set_own(lAll,lt + Model._loo_prior(weights))
+            lAll=Model._set_own(lAll,Model._lpdf_quad(q,logdet,R.shape[0],m) + Model._loo_prior(weights))
         elif bLeaveOneOut:
             muL,covL=Model._ctg_stats_loo(Rm,weights,m)
             noiseL=Model._noise_loo(noiseCov,RVar,weights,m)
@@ -546,13 +627,17 @@ class Model(_Static):
         cov=cov + Nc.astype(cov.dtype)
         x=jnp.transpose(Rc,(1,2,0))[:,:,None,:] - mu.T[None,None,:,:]
         lAll=lcn0(x,cov[None,None])
-        if bLeaveOneOut and Model._loo_needs_all(m):
+        if bLeaveOneOut and Model._loo_pooled_low_rank(m):
+            q,logdet=Model._loo_quad_all(Rc,Rmc,Nc,blocks(Model._noise_loo(noiseCov,RVar,weights)) if m.bLooNoise else None,
+                                         weights,m,Y,bCentered=not bZero)
+            lAll=Model._add_own(Model._lpdf_quad(q,logdet,h,m),Model._loo_prior(weights))
+        elif bLeaveOneOut and Model._loo_needs_all(m):
             muL,covL=Model._ctg_stats_loo_all(Rmc,weights,m,Y,bCentered=not bZero)
             NcL=blocks(Model._noise_all(noiseCov,Model._noise_loo(noiseCov,RVar,weights,m)))
             lAll=Model._add_own(lcn0(jnp.transpose(Rc,(1,2,0))[:,:,None,:]-muL,covL+NcL.astype(covL.dtype)),Model._loo_prior(weights))
         elif bLeaveOneOut and Model._loo_rank_one(m):
             q,logdet=Model._loo_quad(Rc,Rmc,Nc,weights,bCentered=not bZero)
-            lAll=Model._set_own(lAll,-q-h*np.log(np.pi)-logdet + Model._loo_prior(weights))
+            lAll=Model._set_own(lAll,Model._lpdf_quad(q,logdet,h,m) + Model._loo_prior(weights))
         elif bLeaveOneOut:
             muL,covL=Model._ctg_stats_loo(Rmc,weights,m,bCentered=not bZero)
             NcL=blocks(Model._noise_loo(noiseCov,RVar,weights,m))

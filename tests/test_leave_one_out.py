@@ -302,3 +302,67 @@ class TestRankOneLeaveOneOut:
         unit.train_new(2)
         h=np.asarray(unit.optimizer.loss_hist)
         assert np.all(np.isfinite(h)) and h[-1]<h[0]
+
+
+POOLED_LOW_RANK=[dict(ctgPoolWidth=0.7),dict(covShrink=0.4,covTarget='pooled'),
+                 dict(ctgPoolWidth=0.5,covShrink=0.3,covTarget='pooled')]
+
+
+class TestPooledLowRankLeaveOneOut:
+    """
+    pooled statistics (ctgPoolWidth, the pooled shrinkage target) without covRank, pooled means or diagonal shrinkage:
+    every category's left-out covariance is one matrix per pair of categories minus a rank-one term (Model._loo_quad_all),
+    checked against the general path, which builds every left-out covariance
+    """
+
+    @staticmethod
+    def both(modelType,kw,gen_kw,monkeypatch,noiseCov=None,seed=5):
+        unit,R,Rm,RVar,nc=model_inputs(modelType,bLeaveOneOut=True,**kw,**gen_kw)
+        assert ama.Model._loo_pooled_low_rank(unit.model)
+        R=R+0.3*jnp.asarray(np.random.default_rng(seed).standard_normal(R.shape))
+        noiseCov=nc if noiseCov is None else noiseCov(R.shape[0],R.shape[-1])
+        w=unit.stim.weights
+        fun=getattr(ama.Model,'_model__'+modelType)
+        fast=np.asarray(fun(R,Rm,RVar,noiseCov,None,w,True,unit.model,unit.stim.Y))
+        with monkeypatch.context() as mp:
+            mp.setattr(ama.Model,'_loo_pooled_low_rank',staticmethod(lambda m: False))
+            slow=np.asarray(fun(R,Rm,RVar,noiseCov,None,w,True,unit.model,unit.stim.Y))
+        return fast,slow,np.asarray(w)>0
+
+    @pytest.mark.parametrize('bLooNoise',[True,False])
+    @pytest.mark.parametrize('kw',POOLED_LOW_RANK)
+    @pytest.mark.parametrize('modelType,mkw,gen_kw',MODELS+[('gss',dict(),dict(gen=ts.unequal_counts))])
+    def test_matches_general_path(self,modelType,mkw,gen_kw,kw,bLooNoise,monkeypatch):
+        if modelType=='circ':
+            kw=dict(kw,ctgPoolWidth=2.) if 'ctgPoolWidth' in kw else kw
+        fast,slow,valid=self.both(modelType,dict(mkw,bLooNoise=bLooNoise,**kw),gen_kw,monkeypatch)
+        assert np.all(np.isfinite(fast))
+        assert np.allclose(fast[valid],slow[valid],rtol=1e-10,atol=1e-10)
+
+    @pytest.mark.parametrize('bLooNoise',[True,False])
+    def test_correlated_noise(self,bLooNoise,monkeypatch):
+        def noise(n,nC):
+            A=np.random.default_rng(1).standard_normal((nC,n,n))
+            return jnp.asarray(A@np.swapaxes(A,1,2)/n+0.2*np.eye(n))
+        fast,slow,valid=self.both('gss',dict(ctgPoolWidth=0.7,bLooNoise=bLooNoise),{},monkeypatch,noise)
+        assert np.allclose(fast[valid],slow[valid],rtol=1e-10,atol=1e-10)
+
+    def test_gradient_matches_general_path(self,monkeypatch):
+        x,s,ci,Y,_=ts.gaussian_ctg()
+        unit=ama.Unit(ama.Stim(x,s,ci,Y),ama.Nrn(),ama.Model('student','mean',bLeaveOneOut=True,ctgPoolWidth=0.7,df=6.),
+                      ama.Objective('map'),ama.Optimizer(nIterMax=1,bVerbose=False))
+        unit._finalize(2,np.arange(2),dtype=jnp.float64)
+        lf=lambda f: unit._loss_fun_lrn({'f':f},unit.rng,unit.filter.prepped_jx,unit.filter._insert_index_jx,
+                                        unit.stim.val,unit.stim.weights,unit.stim.yCtg,unit.stim.Y)
+        f=jnp.asarray(np.random.default_rng(2).standard_normal(unit.filter._shape))
+        fast=np.asarray(jax.grad(lf)(f))
+        monkeypatch.setattr(ama.Model,'_loo_pooled_low_rank',staticmethod(lambda m: False))
+        # a new unit, so the jitted loss is traced again with the general path
+        unit.model=unit.model.copy(); unit.model.nFA=unit.model.nFA+1; unit._set_geometry()
+        slow=np.asarray(jax.grad(lf)(f))
+        assert np.all(np.isfinite(fast)) and np.allclose(fast,slow,rtol=1e-8,atol=1e-10)
+
+    def test_general_path_otherwise(self):
+        for kw in (dict(ctgPoolWidth=0.5,bPoolMeans=True),dict(ctgPoolWidth=0.5,covRank=1),dict(ctgPoolWidth=0.5,covShrink=0.2),
+                   dict(covShrink=0.2),dict()):
+            assert not ama.Model._loo_pooled_low_rank(ama.Model('gss','mean',bLeaveOneOut=True,**kw))

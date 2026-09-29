@@ -282,7 +282,7 @@ nNoiseSamples, bFixedNoise - the mean-response approximation decodes noise-free 
 
 bLeaveOneOut - the likelihoods are fit to the stimuli they score, so each stimulus is otherwise decoded against statistics that include it. That makes the training cost optimistic when noise is low, filters are many, or categories (or batches) are small. With `bLeaveOneOut=True`:
 - 'full' - the posterior is Eq 5 with the decoded stimulus removed from the training set
-- 'gss', 'student', 'circ' - the category statistics are recomputed without the stimulus, exactly: its own category's mean and covariance by a rank-one downdate, and with `ctgPoolWidth` (and `bPoolMeans`) or `covTarget='pooled'` shrinkage every category's pooled covariance (and mean), which the stimulus also enters. Needs at least 3 stimuli per category (2 with `ctgPoolWidth` or `circMean='zero'`), also in every batch (`Optimizer nBatchMinCtg`).
+- 'gss', 'student', 'circ' - the category statistics are recomputed without the stimulus, exactly: its own category's mean and covariance by a rank-one downdate, and with `ctgPoolWidth` (and `bPoolMeans`) or `covTarget='pooled'` shrinkage every category's pooled covariance (and mean), which the stimulus also enters. Without `bPoolMeans`, `covRank` or diagonal shrinkage, every left-out pooled covariance is one matrix per pair of categories minus a rank-one term, so the other categories' likelihoods cost O(nF^2) per stimulus after nCtg^2 Cholesky factorizations (the own category's needs one per stimulus with `bLooNoise`): on the disparity set ('student', `ctgPoolWidth=1`, GPU) an iteration took 7.4 ms instead of 21.0 ms with 16 filters (6.9 ms instead of 19.7 ms with `bLooNoise=False`; 5.2 ms without leave-one-out), and 6.7 ms instead of 6.9 ms with 4 (5.2 ms instead of 6.4 ms with `bLooNoise=False`; 3.8 ms without leave-one-out). Needs at least 3 stimuli per category (2 with `ctgPoolWidth` or `circMean='zero'`), also in every batch (`Optimizer nBatchMinCtg`).
 
 The stimulus is also left out of its category's prior, `(N_k-1)/(N-1)`, and of its category's noise covariance (the mean noise variance), unless `bLooNoise=False`, which keeps the category's noise covariance (an O(1/N_k) change; none with `fano=0`). Then, without `covRank`, `covShrink` or pooling, the left-out covariance of 'gss', 'student' and 'circ' is a rank-one downdate of one matrix per category, and each left-out likelihood costs O(nF^2) by the matrix determinant lemma and Sherman-Morrison instead of a Cholesky factorization per stimulus: on the disparity set (GPU, float32) an iteration took 0.47 ms instead of 0.84 ms with 8 filters (0.37 ms without leave-one-out), and 0.43 ms instead of 0.56 ms with 4. Full AMA's form already has the left-out prior. Not available with `errType='mle'`. Held-out evaluation (`unit.evaluate`, `cross_validate`) is unaffected.
 
@@ -554,9 +554,10 @@ V2
 
 
 Possible optimizations
-- bLeaveOneOut ('gss', 'student', 'circ', 'mix'): with the default bLooNoise=True (and with covRank, covShrink or pooling),
+- bLeaveOneOut ('gss', 'student', 'circ', 'mix'): with the default bLooNoise=True (and with covRank or covShrink),
   one Cholesky per stimulus of its left-out covariance: the left-out noise covariance rescales its diagonal per stimulus,
-  which is not a low-rank update (bLooNoise=False uses the rank-one downdate). The full lAll is also computed before its
+  which is not a low-rank update (bLooNoise=False uses the rank-one downdate; pooling without bPoolMeans uses rank-one
+  downdates for the other categories). The full lAll is also computed before its
   diagonal is replaced. With covRank, leave-one-out runs the factor analysis EM per stimulus. With pooling (or the pooled shrinkage
   target) every category's covariance differs per stimulus: one Cholesky per stimulus and category, and tensors of
   [ nStim x nCtg x nF x nF ] per category (O(nCtg^2 nF^2) work per stimulus); a low-rank update of the shared pooled
