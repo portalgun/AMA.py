@@ -33,12 +33,27 @@ class _Evaluation:
 
         return self._noise_average(one,rng_key)[0]
 
-    def evaluate(self,stim):
+    def _decoder(self,model):
+        # this unit, or a copy of it (same filters, stimuli and learned parameters) that decodes with another Model
+        if model is None:
+            return self
+        if not self.nrn.bFinalized:
+            raise Exception('train (or finalize) the unit first')
+        unit=self.split()
+        unit.model=model.copy()
+        unit._set_geometry()
+        unit._check()
+        return unit
+
+    def evaluate(self,stim,model=None):
         """
         cost of decoding other stimuli (e.g. a held-out test set) with the current filters. This unit's stimuli are the
         training set: the category response distributions (AMA-Gauss), the reference stimuli (full AMA), the prior,
-        and the whitening all come from them.
+        and the whitening all come from them. model: decode with this Model instead of the unit's (e.g. filters
+        trained under 'gss', decoded with 'student'); the unit's own Model is not changed
         """
+        if model is not None:
+            return self._decoder(model).evaluate(stim)
         test=self._prepare_stim(stim)
         return float(self._loss_fun_heldout(self._params_out(),self.rng,test.val,test.weights,test.yCtg,test.Y,
                                             self.stim.val,self.stim.weights,self.stim.yCtg))
@@ -57,25 +72,26 @@ class _Evaluation:
         lAll,Yc=self._lik_parts(self._likelihoods_heldout(obs,ref,self.stim.weights,self.stim.Y,self._yRef(self.stim.yCtg)))
         return Objective._posterior__true(lAll,self.stim.weights),test,Yc
 
-    def estimates(self,estType='mode',stim=None):
+    def estimates(self,estType='mode',stim=None,model=None):
         """
         estimates of the latent variable [ nStim_Ctg x nCtg (x nDim) ] (grouped like Stim.val; see Stim.weights) for the
         training stimuli, or for other stimuli decoded with the training set: 'mode' (MAP), 'mean' (MMSE; circular on
         circular dimensions), 'median', or 'cmean' (circular mean, Y in radians). With Model bWithin, continuous
-        estimates within the categories
+        estimates within the categories. model: decode with this Model instead of the unit's (see evaluate)
         """
-        lpost,st,Yc=self._log_posterior(stim)
+        lpost,st,Yc=self._decoder(model)._log_posterior(stim)
         return np.asarray(getattr(Objective,'_est__'+estType)(lpost,st.Y,st.Yperiod,Yc))
 
-    def performance(self,estType='mode',stim=None):
+    def performance(self,estType='mode',stim=None,model=None):
         """
         estimation performance per latent level for the training stimuli, or for other stimuli decoded with the training
         set: bias, sd, and rmse of the estimates ([ nCtg (x nDim) ]; errors wrap on circular dimensions) and over all
         stimuli (rmseAll); pCorrect and confusion [ true x MAP category ] of the MAP category; and cost, the mean -log
         posterior at the correct level. Errors are measured from each stimulus's own latent value (Stim y), which for
-        stimuli without their own values is their category's level
+        stimuli without their own values is their category's level. model: decode with this Model instead of the unit's
+        (see evaluate)
         """
-        lpost,st,Yc=self._log_posterior(stim)
+        lpost,st,Yc=self._decoder(model)._log_posterior(stim)
         lpost=np.asarray(lpost)
         est=np.asarray(getattr(Objective,'_est__'+estType)(jnp.asarray(lpost),st.Y,st.Yperiod,Yc))
         w=np.asarray(st.weights)>0

@@ -106,6 +106,43 @@ class TestHeldOut:
             unit.evaluate(ama.Stim(x,s,ci,Y+1))
 
 
+class TestOtherDecoder:
+    """evaluate / estimates / performance with model=: the unit's filters decoded with another likelihood"""
+
+    @pytest.mark.parametrize('trained,decoded',[('gss','full'),('full','gss')])
+    def test_matches_a_unit_of_that_model(self,trained,decoded):
+        x,s,ci,Y,_=ts.unequal_counts(counts=(12,30,20))
+        train,test=ama.Stim(x,s,ci,Y).train_test(0.3,seed=0)
+        unit=unit_from(train,None,trained)
+        other=unit_from(train,None,decoded)
+        assert np.isclose(unit.evaluate(test,model=ama.Model(decoded,'mean')),other.evaluate(test),rtol=1e-10)
+        assert np.isclose(unit.evaluate(test,model=ama.Model(decoded,'mean')),heldout_reference(other,test),rtol=1e-8)
+        assert np.allclose(unit.estimates('mean',test,model=ama.Model(decoded,'mean')),other.estimates('mean',test))
+        assert np.isclose(unit.performance(stim=test,model=ama.Model(decoded,'mean'))['cost'],other.evaluate(test),rtol=1e-10)
+        assert np.isclose(unit.performance(model=ama.Model(decoded,'mean'))['cost'],float(other.loss),rtol=1e-10)
+        # the unit itself is unchanged
+        assert unit.model.modelType==trained
+        assert np.isclose(unit.evaluate(test),unit_from(train,None,trained).evaluate(test),rtol=1e-12)
+
+    def test_student_with_learned_response_parameters(self):
+        x,s,ci,Y,_=ts.gaussian_ctg()
+        train,test=ama.Stim(x,s,ci,Y).train_test(0.3,seed=0)
+        unit=ama.Unit(train,ama.Nrn(bBias=True,activationType='relu'),ama.Model('gss','mean'),ama.Objective('map'),
+                      ama.Optimizer(nIterMax=20,lRate0=0.05,bVerbose=False))
+        unit.train_new(2)
+        ref=unit.split()
+        ref.model=ama.Model('student','mean',df=6.)
+        ref._set_geometry()
+        assert np.isclose(unit.evaluate(test,model=ama.Model('student','mean',df=6.)),ref.evaluate(test),rtol=1e-10)
+        assert not np.isclose(unit.evaluate(test,model=ama.Model('student','mean',df=6.)),unit.evaluate(test))
+
+    def test_invalid_decoder_raises(self):
+        x,s,ci,Y,_=ts.unequal_counts(counts=(12,30,20))
+        unit=unit_from(ama.Stim(x,s,ci,Y),ama.Nrn(rho=None))
+        with pytest.raises(Exception,match='needs response noise'):
+            unit.evaluate(ama.Stim(x,s,ci,Y),model=ama.Model('full','mean'))
+
+
 #- estimates and performance
 
 class TestEstimates:

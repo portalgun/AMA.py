@@ -476,9 +476,9 @@ same=ama.Unit.from_config('unit.yaml', stim, bTrain=True, stimVal=stimVal)
 
 #### Evaluation
 - `unit.loss` - cost on the training stimuli
-- `unit.evaluate(stim)` - cost on other stimuli, decoded with the training set: category response distributions (AMA-Gauss), reference stimuli (full AMA), prior, and whitening all come from the training stimuli
-- `unit.estimates(estType='mode',stim=None)` - estimates of the latent variable: 'mode' (MAP), 'mean', 'median', 'cmean'
-- `unit.performance(estType='mode',stim=None)` - per level: bias, sd, and rmse of the estimates (from each stimulus's own value with Stim `y`), rmseAll over all stimuli; pCorrect and confusion of the MAP category; and cost
+- `unit.evaluate(stim,model=None)` - cost on other stimuli, decoded with the training set: category response distributions (AMA-Gauss), reference stimuli (full AMA), prior, and whitening all come from the training stimuli. `model`: decode with another `Model` than the one the filters were trained with (e.g. `ama.Model('student','mean')` for AMA-Gauss filters); the unit's own is not changed
+- `unit.estimates(estType='mode',stim=None,model=None)` - estimates of the latent variable: 'mode' (MAP), 'mean', 'median', 'cmean'
+- `unit.performance(estType='mode',stim=None,model=None)` - per level: bias, sd, and rmse of the estimates (from each stimulus's own value with Stim `y`), rmseAll over all stimuli; pCorrect and confusion of the MAP category; and cost
 - `unit.cross_validate(n,k=5,seed=0,**train_kw)` - train `n` filters on each of `k` stratified folds and evaluate on the held-out fold
 - `unit.responses`, `unit.likelihoods`, `unit.posterior`, `unit.error` - intermediate results for the training stimuli
 - `unit.split(stimInd)` - a unit with a subset of the stimuli (evaluated with their own statistics; use `evaluate` for held-out data)
