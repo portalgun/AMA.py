@@ -52,7 +52,7 @@ class Stim:
         self.nCtg=len(self.ctg)
 
         Y=np.asarray(Y,dtype=float)
-        if Y.ndim==2 and 1 in Y.shape:
+        if Y.ndim==2 and (Y.shape[1]==1 or (Y.shape[0]==1 and self.nCtg>1)):
             Y=Y.ravel()                                                    # a row or column vector (e.g. from matlab)
         if Y.ndim not in (1,2):
             raise Exception('Y must be [ nCtg ] or [ nCtg x nDim ]')

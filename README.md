@@ -264,7 +264,7 @@ modelType
 - 'gss' - AMA-Gauss: the responses to each category are gaussian, with the mean and covariance of the category's mean responses plus the noise covariance (Jaini & Burge 2017)
 - 'full' - the original AMA: each category's likelihood is the average over its stimuli of the noisy response distribution to each stimulus (Burge & Jaini 2017, Eq 5)
 - 'student' - as 'gss', with a multivariate student t of `df` degrees of freedom (df > 2) whose covariance matches the category covariance plus noise: heavy tails, as natural-image responses have
-- 'circ' - a circular (proper) complex gaussian on quadrature-pair responses (fourierType=2, no whitening): hermitian category covariances, so half the parameters of 'gss' on the real and imaginary parts, and circular symmetry built in. With `circMean='zero'` the category mean is fixed at zero and the covariance is the second moment `E[R R^H]`: the likelihood when each stimulus's complex gain (contrast and phase, e.g. edge polarity or feature type) is unknown, `R = G m + noise`
+- 'circ' - a circular (proper) complex gaussian on quadrature-pair responses (fourierType=2, no whitening): hermitian category covariances, so half the parameters of 'gss' on the real and imaginary parts, and circular symmetry built in. With `circMean='zero'` the category mean is fixed at zero and the covariance is the second moment `E[R R^H]`: the likelihood when each stimulus's complex gain (contrast and phase, e.g. edge polarity or feature type) is unknown, `R = G m + noise`. The noise enters as the complex covariance `N_rr + N_ii` of its real and imaginary blocks: exact for independent noise, an approximation with `rho≠0`, where the cross blocks `N_ri` make the real noise non-circular and are dropped
 
 - 'mix' - a gaussian mixture per category with `nMix` components, `p(R|X_i) = sum_c pi_ic N(R; mu_ic, Sigma_ic + noise)`: for responses that are multimodal within a category (e.g. sign or phase flips from nuisance variables), between the single gaussian of 'gss' and the O(N^2) cost of 'full'. The mixture is fit to each category's mean responses by `nEM` EM iterations inside the cost, initialized by quantiles along the category's first principal axis, and differentiated through, so the gradient includes how the fit moves with the filters. `nMix=1` with `mixReg=0` is 'gss'. With `bWarmEM=True`, each training iteration starts EM from the previous iteration's (maximum likelihood) fit and runs only `nEMWarm` iterations; the fit carries across batches, and `unit.loss`/`evaluate` still fit from scratch with `nEM`. `bLeaveOneOut` removes the stimulus's responsibility-weighted share (of its mean response) from its own category's components, holding the responsibilities of the full fit fixed. `covRank` applies to the component covariances. `covShrink` shrinks each component covariance toward its diagonal (`covTarget='diag'`) or the pooled covariance of all categories (`'pooled'`). With `ctgPoolWidth`, component c of category i also borrows the kernel-weighted scatter of the other categories in proportion to its weight, `Sigma_ic = (S_ic + pi_ic P_i)/(dof_ic + pi_ic Q_i)` with `P_i = sum_{j!=i} K_ij S_j` and `Q_i = sum_{j!=i} K_ij (N_j-1)` over their whole-category scatters, so that `nMix=1` is 'gss' with the same pooling (`bPoolMeans` is not used). With pooling, `bLeaveOneOut` also removes the stimulus from the other categories' pooled statistics. A warm start from a fit in which EM emptied a component starts again from the initialization, so the component can recover. Needs at least `2*nMix` stimuli per category (also per batch).
 
@@ -319,7 +319,7 @@ errType
 - 'map' - `-log posterior` at the correct level: the 0,1 cost (Burge & Jaini 2017, Eq 9)
 - 'mle' - `-log likelihood` at the correct level
 - 'l2' (or 2) - squared error of the estimate; estType defaults to 'mean' (MMSE)
-- 'l1' (or 1) - absolute error of the estimate; estType defaults to 'median'
+- 'l1' (or 1) - absolute error of the estimate; estType defaults to 'median'. The median's error is piecewise linear in the posterior, and its cost has many local optima (use `nRestarts`)
 
 Divergences between the posterior over the levels and a target distribution around the correct level:
 - 'xent' - cross-entropy; the same as 'map' with the one-hot target
@@ -334,7 +334,7 @@ With several latent dimensions (euclidean distance between levels, wrapped on ci
 - 'fisher' needs the levels on a cartesian grid (every combination of the per-dimension values): scores are finite differences along each grid axis, and the divergence sums the per-axis terms.
 - Circular dimensions must span less than their period.
 
-estType - 'mean' (circular on circular dimensions), 'median' (per dimension; on circular dimensions the circular median), 'mode' (MAP; no gradient), or 'cmean' (circular mean, Y in radians; superseded by `Stim Yperiod` with 'mean')
+estType - 'mean' (circular on circular dimensions), 'median' (per dimension, interpolating the cdf at the middle of each level's mass, so a posterior concentrated at one level has that level as its median; on circular dimensions the circular median), 'mode' (MAP; no gradient), or 'cmean' (circular mean, Y in radians; superseded by `Stim Yperiod` with 'mean')
 
 lossType - 'mean' or 'median' over the valid stimuli
 
@@ -395,7 +395,7 @@ unit=ama.Unit(stim,nrn,model,objective,optimizer=None,seed=None,name=None)
 ```python
 unit.train_new(n,fourierType=None,bSplit=None,stimInd=None,dtype=None,optimizer=None,nRestarts=1)
 ```
-Discard current filters (if any) and learn `n` new filters. With `nRestarts=k`, learn from `k` random initial filter sets and keep the one with the lowest cost: on the validation stimuli when `stimVal` is given, else on the training stimuli (costs in `unit.restart_costs`).
+Discard current filters (if any) and learn `n` new filters. With `nRestarts=k`, learn from `k` random initial filter sets and keep the one with the lowest cost: on the validation stimuli when `stimVal` is given, else on the training stimuli (costs in `unit.restart_costs`). Every restart starts the learned response-model parameters (`bBias`, readouts, normalization pools) from their values before the call.
 
 ```python
 unit.train_append(n,...,nRestarts=1)
@@ -407,7 +407,7 @@ unit.train_recurse(ind_rec=None,...)
 ```
 Continue learning the current filters (or only those in `ind_rec`).
 
-All three accept `stimVal` for early stopping (see Optimizer `patience`).
+`train_append` and `train_recurse` keep the current filters as they are parameterized, so they can not change `fourierType` or `bSplit` (they raise); `train_new` can. All three accept `stimVal` for early stopping (see Optimizer `patience`).
 
 ```python
 unit.train_parametric(n,family='morse',fourierType=2,bTied=True,orientations=None,init=None,stimVal=None,bPhase=False)

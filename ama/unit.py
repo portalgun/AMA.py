@@ -71,6 +71,7 @@ class Unit(_Static,_Banks,_Evaluation,_Persistence,_Plotting):
         unit.nrn_p=self.nrn_p
         unit.multiscale_out=getattr(self,'multiscale_out',None)
         unit.param_out=getattr(self,'param_out',None)
+        unit.train_log=list(getattr(self,'train_log',[]) or [])
 
         if self.nrn.bFinalized:
             ind=self.nrn.filter.index
@@ -159,7 +160,7 @@ class Unit(_Static,_Banks,_Evaluation,_Persistence,_Plotting):
             warnings.warn(' and '.join(learned) + ' without Nrn respBudget: against the fixed additive noise (var0), the '
                           'learned weights can lower the cost by growing the responses rather than by coding better, so '
                           'costs are not comparable to fixed response models. Set respBudget (e.g. 1.) to fix each '
-                          "response dimension's root mean square",stacklevel=5)
+                          "response dimension's root mean square",stacklevel=_user_stacklevel())
 
     @property
     def _nDim(self):
@@ -185,7 +186,7 @@ class Unit(_Static,_Banks,_Evaluation,_Persistence,_Plotting):
         if mMin < self._nDim+1 and self.model.covRank is None:
             warnings.warn('batches have as few as ' + str(mMin) + ' stimuli in a category, fewer than the ' + str(self._nDim+1)
                           + ' needed for a full-rank AMA-Gauss covariance of ' + str(self._nDim) + ' response dimensions; '
-                          'increase batchSize or Optimizer nBatchMinCtg',stacklevel=3)
+                          'increase batchSize or Optimizer nBatchMinCtg',stacklevel=_user_stacklevel())
 
     def _check(self):
         counts=np.asarray(self.stim.weights).sum(0)
@@ -408,6 +409,7 @@ class Unit(_Static,_Banks,_Evaluation,_Persistence,_Plotting):
     def train_recurse(self,ind_rec=None,fourierType=None,bSplit=None,stimInd=None,dtype=None,optimizer=None,stimVal=None):
         if optimizer is not None:
             self.optimizer=optimizer
+        self.restart_costs=None                # they described the restarts of an earlier call
 
         n=self.nrn.filter.n
         full=np.arange(n)

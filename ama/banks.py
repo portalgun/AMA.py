@@ -65,6 +65,7 @@ class _Banks:
         with this unit's Optimizer (optimizerType, lRate0, nIterMax, nStepsPerChunk, batchSize, bVerbose, patience with
         stimVal). Returns the final (or best validation) params.
         """
+        self.restart_costs=None                # they described the restarts of an earlier call
         loss=_GeneratedLoss(self,kind,cfg)
         val_fun=None
         if stimVal is not None:

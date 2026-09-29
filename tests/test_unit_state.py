@@ -183,3 +183,21 @@ class TestReviewRegressions:
         k=u._opt_state_key
         u.optimizer=ama.Optimizer('lbfgs',nIterMax=5,lbfgsMemory=4,bVerbose=False)
         assert u._opt_key(u._opt_param_shape)!=k
+
+    def test_split_keeps_the_training_log(self):
+        u=mk(nIterMax=5)
+        u.train_new(1)
+        assert [s['method'] for s in u.split().config()['train']]==['train_new']
+
+    def test_budget_warning_points_at_the_callers_line(self,tmp_path):
+        x,s,ci,Y,_=ts.gaussian_ctg()
+        st=ama.Stim(x,s,ci,Y)
+        u=ama.Unit(st,ama.Nrn(normalizeType='gen',bLearnNormPool=True),ama.Model('gss','mean'),ama.Objective('map'),
+                   ama.Optimizer(nIterMax=2,bVerbose=False))
+        with pytest.warns(UserWarning,match='respBudget') as rec:
+            u.train_new(1)
+        assert rec[0].filename==__file__
+        u.save(tmp_path/'u.pkl')
+        with pytest.warns(UserWarning,match='respBudget') as rec:
+            ama.Unit.load(tmp_path/'u.pkl',st)
+        assert rec[0].filename==__file__

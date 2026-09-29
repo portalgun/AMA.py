@@ -9,6 +9,7 @@ import functools
 import importlib
 import inspect
 import pickle
+import sys
 import warnings
 import numpy as np
 import jax
@@ -48,13 +49,23 @@ def contrast_normalize(stimuli):
     norm=np.linalg.norm(flat,axis=0,keepdims=True)
     return np.reshape(flat/np.where(norm>0,norm,1),s.shape)
 
+def _user_stacklevel():
+    # the warnings.warn stacklevel of the first caller outside this package, for the function that calls this one: a
+    # warning then points at the user's line whichever entry point (train_new, load, from_config, ...) led to it
+    import os
+    d=os.path.dirname(os.path.abspath(__file__))
+    f,level=sys._getframe(1),1
+    while f is not None and os.path.dirname(os.path.abspath(f.f_code.co_filename))==d:
+        f,level=f.f_back,level+1
+    return level
+
 def _warn_if_not_contrast_normalized(stimuli,tol=1e-3):
     # stimuli [ nPix x nStim ]; the mean component's norm is |mean|*sqrt(nPix)
     norm=np.linalg.norm(stimuli,axis=0)
     mean=np.abs(stimuli.mean(axis=0))*np.sqrt(stimuli.shape[0])
     if np.any(np.abs(norm-1)>tol) or np.any(mean>tol):
         warnings.warn('stimuli are not contrast normalized (zero mean, unit norm), which AMA assumes; '
-                      'pass bContrastNormalize=True to Stim or use ama.contrast_normalize',stacklevel=3)
+                      'pass bContrastNormalize=True to Stim or use ama.contrast_normalize',stacklevel=_user_stacklevel())
 
 def _get_copy_dict(instance,excl=[]):
     flds = [attr for attr in dir(instance) if not attr.startswith('_') and attr not in excl and not callable(getattr(instance,attr))]

@@ -625,7 +625,8 @@ class Model(_Static):
         mu,cov=Model._ctg_stats(Rmc,weights,m,Y,bCentered=not bZero)
         if bZero:
             mu=jnp.zeros_like(mu)
-        # circular noise: the complex variance is the sum of the real and imaginary component (co)variances
+        # circular noise: the complex variance is the sum of the real and imaginary component (co)variances. The cross
+        # blocks (real-imaginary, nonzero with rho) are dropped: a circular approximation of non-circular noise
         blocks=lambda M: M[...,:h,:h] + M[...,h:,h:]
         Nc=blocks(noiseCov)
         cov=cov + Nc.astype(cov.dtype)

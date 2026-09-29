@@ -49,3 +49,11 @@ def test_errors(tmp_path):
         ama.Stim.load(fname,dims=(2,2))
     with pytest.raises(Exception,match='.mat and .npz'):
         ama.Stim.load(str(tmp_path/'x.txt'))
+
+
+def test_one_category_with_several_latent_dimensions():
+    """Y [ 1 x nDim ] is one category's point, not a row vector of levels"""
+    x,s,ci,Y,_=ts.gaussian_ctg()
+    keep=np.asarray(ci)==np.asarray(ci)[0]
+    st=ama.Stim(x,np.asarray(s)[:,keep],np.asarray(ci)[keep],np.array([[1.,2.]]))
+    assert np.asarray(st.Y).shape==(1,2)
