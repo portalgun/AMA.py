@@ -69,6 +69,11 @@ class TestSplits:
         pad=np.asarray(test.weights)==0
         assert np.all(np.asarray(test.val)[:,pad]==0)                        # padding stays zero
 
+    def test_train_test_needs_two_stimuli_per_category(self):
+        x,s,ci,Y,_=ts.unequal_counts(counts=(1,5,4))
+        with pytest.raises(Exception,match='at least 2 stimuli'):
+            ama.Stim(x,s,ci,Y).train_test(0.3)
+
     def test_folds_test_every_stimulus_once(self):
         x,s,ci,Y,info=ts.unequal_counts(counts=(10,30,20))
         st=ama.Stim(x,s,ci,Y)

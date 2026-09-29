@@ -152,6 +152,8 @@ class Stim:
         rng=np.random.default_rng(seed)
         train,test=[],[]
         for i in self._valid_indices():
+            if len(i)<2:
+                raise Exception('train_test needs at least 2 stimuli in every category (one for each part)')
             i=rng.permutation(i)
             nTest=int(np.clip(np.round(testFraction*len(i)),1,len(i)-1))
             test.append(np.sort(i[:nTest]))

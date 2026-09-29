@@ -390,7 +390,7 @@ class Nrn(_Static):
                 Mii=1.
             else:
                 V=Nrn._pool_rows(v1,M**2)
-                Mii=jnp.diagonal(M).reshape((-1,)+(1,)*(r.ndim-1))
+                Mii=jnp.diagonal(M).astype(jnp.real(r).dtype).reshape((-1,)+(1,)*(r.ndim-1))   # a float64 normPool stays out of float32 learning
             var=v1/D**2 - 2*Mii*jnp.abs(r)*v1/D**3 + r**2*V/D**4
         else:
             # linear normalizations ('broad', 'narrow') divide each response by a stimulus-dependent denominator: its gain
@@ -490,7 +490,9 @@ class Nrn(_Static):
     def _activation__nakarushton(R,bComplex,nrn=None):
         c50=nrn.rmax/4 if nrn.c50 is None else nrn.c50
         def nr(x):
-            xp=jnp.maximum(x,0)**nrn.nNR
+            # x**nNR only where x > 0: at 0 its derivative is infinite for nNR < 1, which times the 0 of the rectification is NaN
+            pos=x>0
+            xp=jnp.where(pos,jnp.where(pos,x,1)**nrn.nNR,0)
             return nrn.rmax*xp/(xp+c50**nrn.nNR)
         return Nrn._componentwise(nr,R,bComplex)
 

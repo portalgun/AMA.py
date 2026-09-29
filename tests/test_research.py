@@ -60,6 +60,14 @@ class TestActivations:
         rp=np.maximum(r,0)**2.5
         assert np.allclose(responses(u)[0],5.7*rp/(rp+0.8**2.5))
 
+    def test_naka_rushton_below_one_has_finite_gradients(self):
+        # x**nNR with nNR < 1 has an infinite derivative at 0; the rectified branch must not turn it into NaN
+        u=unit_for(ama.Nrn(activationType='nakarushton',nNR=0.5))
+        r=linear(u)
+        rp=np.maximum(r,0)**0.5
+        assert np.allclose(responses(u)[0],5.7*rp/(rp+(5.7/4)**0.5))
+        train(unit_for(ama.Nrn(activationType='nakarushton',nNR=0.5),finalize=False,nIterMax=20))
+
     def test_softmax_over_filters(self):
         u=unit_for(ama.Nrn(activationType='softmax',softmaxT=2.),n=3)
         r=linear(u)
@@ -167,6 +175,15 @@ class TestNormalizationPool:
             J=np.asarray(jax.jacfwd(lambda x: x/(u.nrn.eps+jnp.asarray(M)@jnp.abs(x)))(jnp.asarray(r[:,l,k])))
             assert np.allclose(norm(r[:,l,k]),R[:,l,k])
             assert np.allclose(RVar[:,l,k],(J**2)@v[:,l,k])
+
+    def test_float32_stays_float32_with_a_pool(self):
+        # a float64 normPool (under jax x64) must not promote float32 responses and their variances
+        M=np.array([[1.,0.2],[0.5,1.]])
+        x,s,ci,Y,_=ts.gaussian_ctg()
+        u=ama.Unit(ama.Stim(x,s,ci,Y),ama.Nrn(normalizeType='gen',normPool=M,bNoise_1=True),ama.Model('gss','mean'),
+                   ama.Objective('map'),ama.Optimizer(nIterMax=1,bVerbose=False))
+        u._finalize(2,np.arange(2),dtype=jnp.float32)
+        assert all(np.asarray(v).dtype==np.float32 for v in responses(u))
 
     def test_learned_pool(self):
         M=np.array([[1.,0.5],[0.5,1.]])
