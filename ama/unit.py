@@ -140,7 +140,20 @@ class Unit(_Static):
                            last=last
         )
         self._check()
+        self._check_budget()
 
+    def _check_budget(self):
+        # learned response scales against fixed additive noise: see Nrn respBudget
+        nrn=self.nrn
+        if nrn.respBudget is not None or nrn.corrType=='None':
+            return
+        learned=[name for name,b in (('bLearnNormPool',nrn.bLearnNormPool),
+                                     ("readoutType='linear'",str(nrn.readoutType).lower()=='linear')) if b]
+        if learned:
+            warnings.warn(' and '.join(learned) + ' without Nrn respBudget: against the fixed additive noise (var0), the '
+                          'learned weights can lower the cost by growing the responses rather than by coding better, so '
+                          'costs are not comparable to fixed response models. Set respBudget (e.g. 1.) to fix each '
+                          "response dimension's root mean square",stacklevel=5)
 
     @property
     def _nDim(self):

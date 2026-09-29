@@ -3,6 +3,8 @@ Response budget (Nrn respBudget): each final response dimension has a fixed root
 so the size of the responses (rmax, a normalization pool's scale) can not buy signal-to-noise ratio against the fixed
 additive noise. Checked against direct computations.
 """
+import warnings
+
 import numpy as np
 import pytest
 import jax
@@ -100,3 +102,15 @@ class TestBudget:
             ama.Nrn(respBudget=0.)
         assert ama.Nrn(respBudget=2.).copy().respBudget==2.
         assert ama.Nrn(respBudget=2.)._key()!=ama.Nrn(respBudget=3.)._key()
+
+    @pytest.mark.parametrize('nrn_kw',[dict(normalizeType='gen',bLearnNormPool=True),dict(readoutType='linear')])
+    def test_warns_about_learned_scales_without_a_budget(self,nrn_kw):
+        with pytest.warns(UserWarning,match='respBudget'):
+            unit_for(ama.Nrn(**nrn_kw))
+
+    @pytest.mark.parametrize('nrn_kw',[dict(normalizeType='gen',bLearnNormPool=True,respBudget=1.),
+                                       dict(readoutType='linear',rho=None),dict(normalizeType='gen')])
+    def test_no_warning_with_a_budget_or_fixed_scales(self,nrn_kw):
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')
+            unit_for(ama.Nrn(**nrn_kw))
