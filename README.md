@@ -45,31 +45,27 @@ Disparity and speed data from [burgelab/AMA](https://github.com/burgelab/AMA)
 - [AMAdataDisparity.mat](https://github.com/burgelab/AMA/raw/refs/heads/master/AMAdataDisparity.mat) (included in this repository)
 - [AMAdataSpeed.mat](https://github.com/burgelab/AMA/raw/refs/heads/master/AMAdataSpeed.mat) (42 MB, not included; `tests/test_speed.py` uses it from the repository root when present)
 
-On both sets, the AMA-Gauss cost of burgelab's filters matches their reported cost (to 0.001-0.03), and training reaches a lower cost than their filters. Held-out comparison of the likelihood models (4 filters from `train_new(4)`, 600 iterations, the best of 2 seeds by training cost, 30% of the stimuli held out; costs are -log posterior at the correct level, rmse from the posterior mean):
+On both sets, the AMA-Gauss cost of burgelab's filters matches their reported cost (to 0.001-0.03), and training reaches a lower cost than their filters.
 
-| model | disparity: train / held-out / rmse (arcmin) | speed: train / held-out / rmse (deg/s) |
+Held-out comparison of the likelihood models, from [examples/heldout_table.py](examples/heldout_table.py): 4 filters from `train_new(4)`, 600 iterations, the best of 8 restarts by training cost, 30% of the stimuli held out. Costs are -log posterior at the correct level, and rmse is of the posterior mean. Training and the first held-out cost decode mean (noise-free) responses, the paper's approximation; the noisy held-out cost decodes noisy observations of the held-out stimuli (stage-2 noise, averaged over 16 draws), the expected cost of the modeled neurons. In parentheses: how many restarts ended within 0.005 of the best training cost.
+
+| model | disparity: train / held-out / rmse (arcmin) / noisy held-out | speed: train / held-out / rmse (deg/s) / noisy held-out |
 |---|---|---|
-| 'gss' | 1.965 / 1.968 / 7.04 | 1.849 / 1.855 / 2.16 |
-| 'gss', `bLeaveOneOut` | 1.981 / 1.968 / 7.04 | 1.858 / 1.855 / 2.16 |
-| 'gss', `covShrink=0.1` | 2.008 / 2.010 / 7.11 | 1.901 / 1.912 / 2.12 |
-| 'gss', `ctgPoolWidth` one level | 2.038 / 2.039 / 6.83 | 1.937 / 1.943 / 2.15 |
-| 'student', `df=5` | **1.815 / 1.830 / 6.79** | **1.676 / 1.698 / 1.83** |
-| 'mix', `nMix=2` | 1.949 / 1.966 / 6.99 | 1.838 / 1.850 / 2.15 |
-| 'full' | 1.895 / 1.984 / 7.15 | 1.806 / 1.842 / 2.13 |
-| 'full', `bLeaveOneOut` | 1.984 / 1.977 / 7.00 | 1.847 / 1.848 / 1.99 |
+| 'gss' | 1.965 / 1.968 / 7.04 / 2.354 (7/8) | 1.848 / 1.854 / 2.15 / 2.232 (3/8) |
+| 'gss', `bLeaveOneOut` | 1.981 / 1.968 / 7.04 / 2.354 (6/8) | 1.857 / 1.854 / 2.16 / 2.231 (2/8) |
+| 'gss', `covShrink=0.1` | 2.007 / 2.009 / 7.11 / 2.356 (6/8) | 1.900 / 1.912 / 2.12 / 2.242 (8/8) |
+| 'gss', `ctgPoolWidth` one level | 2.038 / 2.038 / 6.84 / **2.352** (8/8) | 1.937 / 1.942 / 2.14 / 2.242 (3/8) |
+| 'student', `df=5` | 1.815 / 1.830 / 6.79 / 2.372 (6/8) | 1.675 / 1.697 / 1.83 / 2.257 (8/8) |
+| 'gss', decoded with 'student' | 1.820 / 1.834 / 6.85 / 2.365 (7/8) | 1.680 / 1.692 / 1.93 / 2.251 (3/8) |
+| 'mix', `nMix=2` | 1.949 / 1.966 / 6.97 / 2.363 (6/8) | 1.838 / 1.850 / 2.15 / 2.233 (3/8) |
+| 'full' | 1.895 / 1.983 / 7.15 / 2.365 (6/8) | 1.806 / 1.842 / 2.12 / 2.215 (8/8) |
+| 'full', `bLeaveOneOut` | 1.984 / 1.977 / 6.99 / 2.369 (7/8) | 1.844 / 1.842 / 2.12 / **2.211** (8/8) |
 
-The heavy-tailed 'student' likelihood decodes both sets best; full AMA fits its training set most closely and generalizes worse than 'gss' on disparity; shrinkage and pooling cost accuracy at these sizes (500 or more stimuli per level). Leave-one-out removes full AMA's optimism (its training cost then matches the held-out cost) but improves the held-out cost little: its gap to 'gss' on disparity is not from scoring each stimulus against itself.
+Compare likelihoods by the noisy held-out cost. With mean responses the Student t looks best by 0.14-0.16, but that is an artifact of the approximation: a category's mean responses are less dispersed than the likelihood's covariance, which includes the noise (their Mahalanobis distance d² averages 1.7-2.2 instead of the 4 of 4 dimensions; a Student t fit to them has df 3.4-5), and the Student t's sharper peak rewards that. Its gain was largest for the stimuli closest to their category's mean, and none of the held-out stimuli was an outlier (none beyond the chi² 99% quantile). Noisy observations are close to gaussian (d² 4.05-4.12, 1.4-1.6% beyond the 99% quantile, fitted df 49-66), and decoding them the Student t is the worst model on both sets. On disparity the models are within 0.02 of each other; on speed full AMA is best (2.211) and 'gss' next (2.232). Leave-one-out removes full AMA's optimism in training (its training cost then matches the held-out cost) but changes its held-out cost little.
 
-Most of the Student t's advantage is in decoding, not in the filters. Filters trained under one likelihood and decoded held out with each (same setup; costs / rmse):
+On speed, most restarts of 600 iterations end in a worse optimum than the best training run found (2 or 3 of 8 for 'gss'), and none of these runs reached the optimum of the training schedule experiment below (held out 1.826 with mean responses, after 2,400 iterations): the speed rows are optimization-limited by about 0.03.
 
-| trained with | disparity: decoded 'gss' | decoded 'student' | speed: decoded 'gss' | decoded 'student' |
-|---|---|---|---|---|
-| 'gss' | 1.968 / 7.04 | 1.834 / 6.84 | 1.854 / 2.16 | **1.692** / 1.92 |
-| 'student', `df=5` | 1.973 / 7.02 | **1.830 / 6.79** | 1.870 / 2.07 | 1.698 / **1.83** |
-
-Decoding AMA-Gauss filters with the Student t gains 0.13-0.16; training under it changes the cost by less than 0.01 either way (it lowers the speed rmse from 1.92 to 1.83).
-
-Training schedule (AMA-Gauss, held-out costs over seeds 1-5, the same 2,400 steps for each schedule): learning all 4 filters jointly (`train_new(4)`), 2 then 2 more (`train_new(2)`, `train_append(2)`, `train_recurse()`), or one at a time then refined:
+Training schedule (AMA-Gauss, held-out costs with mean responses over seeds 1-5, the same 2,400 steps for each schedule): learning all 4 filters jointly (`train_new(4)`), 2 then 2 more (`train_new(2)`, `train_append(2)`, `train_recurse()`), or one at a time then refined:
 
 | schedule | disparity: mean / best | speed: mean / best |
 |---|---|---|
@@ -77,7 +73,7 @@ Training schedule (AMA-Gauss, held-out costs over seeds 1-5, the same 2,400 step
 | 2+2, refined | 1.978 / 1.968 | 1.837 / 1.826 |
 | 1+1+1+1, refined | 2.011 / 1.968 | 1.853 / 1.826 |
 
-On disparity joint training finds the same optimum from every start, while one filter at a time stays in a worse one (2.02) in 4 of 5 seeds even after refining all four. On speed every schedule reaches 1.826 from some start, but joint training does so in only 1 of 5: restarts (`nRestarts`) matter more there than the schedule.
+On disparity joint training finds the same optimum from every start, while one filter at a time stays in a worse one (2.02) in 4 of 5 seeds even after refining all four. On speed every schedule reaches 1.826 from some start, but joint training does so in only 1 of 5.
 
 ## Example Use
 The runnable version of this example is [examples/quickstart.py](examples/quickstart.py).
@@ -551,7 +547,8 @@ See the tests in `tests/` for reference implementations of the math.
 Known limitations
 - likelihoods: 'mix' leave-one-out holds the responsibilities fixed
 - noise: the default mean-response approximation underestimates the expected cost (Model nNoiseSamples estimates it;
-  on the disparity set training on it did not change the filters); stage-1 noise is carried through 'gen' normalization only to first order; noise correlations are specified (rho), with
+  on the disparity set training on it did not change the filters), and misranks likelihoods: mean responses are less
+  dispersed than the likelihood assumes, which favours the peaked Student t (compare held-out costs of noisy observations); stage-1 noise is carried through 'gen' normalization only to first order; noise correlations are specified (rho), with
   stimulus-dependent variances but a fixed correlation structure
 - scaling: without covRank, AMA-Gauss needs more stimuli per category than response dimensions
 - encoder: linear unit-norm filters with a fixed-shape nonlinearity (learned offsets with bBias) and learned
