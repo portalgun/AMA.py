@@ -546,8 +546,6 @@ Known limitations
 - full AMA: nNeighbors still searches all pairs once per chunk (O(N^2), chunked), and without batches is no faster than
   exact full AMA below ~10,000 stimuli on a GPU; with batchSize every stimulus's responses are still computed each
   iteration
-- engineering: `ama/unit.py` (~1,750 lines) still holds training, the generated filter banks, evaluation, saving and
-  plotting together
 
 V2
 - deeper encoders beyond stacked readout layers (e.g. learned nonlinearities, convolutional structure)

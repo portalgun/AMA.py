@@ -18,5 +18,6 @@ from .nrn import *
 from .model import *
 from .objective import *
 from .optimizer import *
+from .response import *
 from .unit import *
-from . import _base, stim, nrn, model, objective, optimizer, unit
+from . import _base, stim, nrn, model, objective, optimizer, response, banks, evaluation, persist, plotting, unit
