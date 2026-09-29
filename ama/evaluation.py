@@ -25,9 +25,11 @@ class _Evaluation:
         W=self.nrn.whitening(refval,f,refweights) if self.nrn._bWhiten else None
         G=self.nrn.gain(refval,f,refweights,W,p)
 
+        # the references enter through their mean responses and variances only, which do not depend on the noise draw: once
+        ref=self.nrn.main(rng_key,refval,f,refweights,W,p,G)
+
         def one(key):
             obs=self.nrn.main(key,stimval,f,stimweights,W,p,G)
-            ref=self.nrn.main(key,refval,f,refweights,W,p,G)
             lAll,Yc=self._lik_parts(self._likelihoods_heldout(obs,ref,refweights,Y,refy))
             return self.objective.lrn_main(lAll,stimweights,yCtg,Y,refweights,Yc),None
 
