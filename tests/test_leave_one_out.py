@@ -376,3 +376,21 @@ def test_noise_free_leave_one_out_trains():
                       ama.Objective('map'),ama.Optimizer(nIterMax=20,lRate0=0.05,bVerbose=False))
         unit.train_new(2)
         assert np.all(np.isfinite(np.asarray(unit.optimizer.loss_hist))) and np.all(np.isfinite(np.asarray(unit.out)))
+
+
+@pytest.mark.parametrize('modelType,kw',[('gss',{}),('student',dict(df=6.)),('gss',dict(ctgPoolWidth=0.5)),('mix',dict(nMix=2))])
+def test_constant_noise_takes_the_fast_path_exactly(modelType,kw,monkeypatch):
+    """fano=0: the noise does not depend on the response, so Unit._lrn_model scores with bLooNoise=False, which is exact"""
+    x,s,ci,Y,_=ts.gaussian_ctg()
+    unit=ama.Unit(ama.Stim(x,s,ci,Y),ama.Nrn(fano=0.),ama.Model(modelType,'mean',bLeaveOneOut=True,**kw),ama.Objective('map'),
+                  ama.Optimizer(nIterMax=1,bVerbose=False))
+    unit._finalize(3,np.arange(3),dtype=jnp.float64)
+    f=np.random.default_rng(0).standard_normal(unit.filter._shape)
+    unit.filter.out=jnp.asarray(f/np.linalg.norm(f,axis=0))
+    assert unit._lrn_model().bLooNoise is False and unit.model.bLooNoise is True
+    fast=float(unit.loss)
+    monkeypatch.setattr(ama.Unit,'_lrn_model',lambda self: self.model)
+    unit.model=unit.model.copy()
+    unit.model.nFA+=1                                   # a new key: trace the general path again
+    unit._set_geometry()
+    assert np.isclose(float(unit.loss),fast,rtol=1e-12)

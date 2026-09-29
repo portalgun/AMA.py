@@ -194,14 +194,24 @@ class _Static:
     def __eq__(self,other):
         return type(self) is type(other) and self._key()==other._key()
 
+def _tri_inv(L):
+    """
+    L^-1 of lower triangular factors L [ ... x n x n ], at their own batch shape. The densities apply it by broadcast
+    multiply-sums: a triangular solve per (stimulus, category) pair would repeat thousands of tiny solves against the
+    same few factors, which XLA:CPU runs one by one (20-40x slower than this on the CPU; the same on the GPU)
+    """
+    eye=jnp.broadcast_to(jnp.eye(L.shape[-1],dtype=L.dtype),L.shape)
+    return lax.linalg.triangular_solve(L,eye,left_side=True,lower=True)
+
+def _tri_apply(Li,x0):
+    # L^-1 x0 [ ... x n ] for Li = L^-1 [ ... x n x n ] (broadcast): fused, nothing [ ... x n x n ] is stored per stimulus
+    return jnp.sum(Li*x0[...,None,:],axis=-1)
+
 @jit
 def lmvn0(x0,cov):
     x0, cov = promote_dtypes_inexact(x0,cov)
     L = lax.linalg.cholesky(cov)
-    y = jnp.vectorize(
-            partial(lax.linalg.triangular_solve, lower=True, transpose_a=True),
-            signature="(n,n),(n)->(n)"
-        )(L, x0)
+    y = _tri_apply(_tri_inv(L),x0)
     return (-1/2 * jnp.einsum('...i,...i->...', y, y)
             - cov.shape[-1]/2 * jnp.log(2*np.pi)
             - jnp.log(L.diagonal(axis1=-1, axis2=-2)).sum(-1))
@@ -211,10 +221,7 @@ def lmvt0(x0,scale,df):
     """log density of a multivariate student t with location 0, scale matrix and df degrees of freedom"""
     x0, scale = promote_dtypes_inexact(x0,scale)
     L = lax.linalg.cholesky(scale)
-    y = jnp.vectorize(
-            partial(lax.linalg.triangular_solve, lower=True, transpose_a=True),
-            signature="(n,n),(n)->(n)"
-        )(L, x0)
+    y = _tri_apply(_tri_inv(L),x0)
     d = scale.shape[-1]
     q = jnp.einsum('...i,...i->...', y, y)
     return (jax.scipy.special.gammaln((df+d)/2) - jax.scipy.special.gammaln(df/2)
@@ -226,10 +233,7 @@ def lmvt0(x0,scale,df):
 def lcn0(z0,cov):
     """log density of a circular (proper) complex gaussian CN(0, cov), z0 complex [ ... x n ], cov hermitian"""
     L = jnp.linalg.cholesky(cov)
-    y = jnp.vectorize(
-            partial(jax.scipy.linalg.solve_triangular, lower=True),
-            signature="(n,n),(n)->(n)"
-        )(L, z0)
+    y = _tri_apply(_tri_inv(L),z0)
     n = cov.shape[-1]
     return (-jnp.real(jnp.einsum('...i,...i->...', jnp.conj(y), y))
             - n*jnp.log(np.pi)

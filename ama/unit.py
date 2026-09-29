@@ -589,7 +589,23 @@ class Unit(_Static,_Banks,_Evaluation,_Persistence,_Plotting):
             take=lambda A: jnp.take_along_axis(A,jnp.broadcast_to(idx,A.shape[:-2]+idx.shape),axis=-2)
             return self.model.lrn_main(R,take(Rm),take(RVar),noiseCov,noiseCorr,take(stimweights),Y,idx,
                                        None if yRef is None else _take_stim(yRef,idx))
-        return self.model.lrn_main(R,Rm,RVar,noiseCov,noiseCorr,stimweights,Y,None,yRef)
+        return self._lrn_model().lrn_main(R,Rm,RVar,noiseCov,noiseCorr,stimweights,Y,None,yRef)
+
+    def _lrn_model(self):
+        # the Model that scores the training stimuli. With a noise variance that does not depend on the response (fano 0,
+        # no stage-1 noise), leaving a stimulus out of its category's noise covariance (bLooNoise) changes nothing, so
+        # the same Model with bLooNoise False is exact, and takes the rank-one / low-rank leave-one-out paths
+        m=self.model
+        if not (m.bLeaveOneOut and m.bLooNoise and self.nrn.fano==0 and not self.nrn.bNoise_1):
+            return m
+        cache=getattr(self,'_lrn_model_cache',None)
+        if cache is None or cache[0]!=m._key():
+            mm=m.copy()
+            mm.bLooNoise=False
+            mm._Yperiod=m._Yperiod
+            mm._bGeometrySet=True
+            cache=self._lrn_model_cache=(m._key(),mm)
+        return cache[1]
 
     def _bRefSubset(self):
         return self.model.modelType=='full' and self.model.nRef is not None

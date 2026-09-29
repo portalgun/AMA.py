@@ -23,10 +23,9 @@ class _Evaluation:
         f=params['f']
         p=params.get('p')
         W=self.nrn.whitening(refval,f,refweights) if self.nrn._bWhiten else None
-        G=self.nrn.gain(refval,f,refweights,W,p)
-
-        # the references enter through their mean responses and variances only, which do not depend on the noise draw: once
-        ref=self.nrn.main(rng_key,refval,f,refweights,W,p,G)
+        # the references enter through their mean responses and variances only, which do not depend on the noise draw: once.
+        # Their respBudget gains G scale the observed stimuli too
+        ref,G=self.nrn.main(rng_key,refval,f,refweights,W,p,bWithGain=True)
 
         def one(key):
             obs=self.nrn.main(key,stimval,f,stimweights,W,p,G)
@@ -68,9 +67,8 @@ class _Evaluation:
             return Objective._posterior__true(lAll,self.stim.weights),self.stim,Yc
         test=self._prepare_stim(stim)
         W=self.nrn.whitening(self.stim.val,f,self.stim.weights) if self.nrn._bWhiten else None
-        G=self.nrn.gain(self.stim.val,f,self.stim.weights,W,self._p())
+        ref,G=self.nrn.main(self.rng,self.stim.val,f,self.stim.weights,W,self._p(),bWithGain=True)
         obs=self.nrn.main(self.rng,test.val,f,test.weights,W,self._p(),G)
-        ref=self.nrn.main(self.rng,self.stim.val,f,self.stim.weights,W,self._p(),G)
         lAll,Yc=self._lik_parts(self._likelihoods_heldout(obs,ref,self.stim.weights,self.stim.Y,self._yRef(self.stim.yCtg)))
         return Objective._posterior__true(lAll,self.stim.weights),test,Yc
 

@@ -439,7 +439,8 @@ class Model(_Static):
         if bCentered:
             x=x+d*(weights/(wc-weights)).T[:,None,:]                             # R - (mu - w d/(N-w))
         L=jnp.linalg.cholesky(B)
-        solve=lambda v: lax.linalg.triangular_solve(L,v,left_side=True,lower=True)   # L^-1 v, v [ nCtg x nF x nStim_Ctg ]
+        Li=_tri_inv(L)
+        solve=lambda v: Li@v                                                   # L^-1 v, v [ nCtg x nF x nStim_Ctg ]
         u,z=solve(d),solve(x)
         uu=jnp.sum(jnp.abs(u)**2,axis=1).T                                       # [ nStim_Ctg x nCtg ]
         zz=jnp.sum(jnp.abs(z)**2,axis=1).T
@@ -493,7 +494,8 @@ class Model(_Static):
             # the own category's mean without the stimulus: o_k - w d/(N_k-w)
             x=x+eye[:,:,None,None]*(d*(weights/(wc-weights)).T[:,None,:])[None]
         L=jnp.linalg.cholesky(B)
-        solve=lambda v: lax.linalg.triangular_solve(L,v,left_side=True,lower=True)
+        Li=_tri_inv(L)
+        solve=lambda v: Li@v
         u,z=solve(jnp.broadcast_to(d[None],x.shape)),solve(x)
         aw=a[...,None]*weights.T[None]                                           # [ i x k x l ]: 0 for padding
         uu=jnp.sum(jnp.abs(u)**2,axis=2)
@@ -508,7 +510,7 @@ class Model(_Static):
               - aw[k,k].T[...,None,None]*dl[...,:,None]*jnp.conj(dl)[...,None,:]
             xo=jnp.transpose(x[k,k],(2,0,1))                                     # [ l x k x nF ]
             Lo=jnp.linalg.cholesky(M)
-            y=lax.linalg.triangular_solve(Lo,xo[...,None],left_side=True,lower=True)[...,0]
+            y=_tri_apply(_tri_inv(Lo),xo)
             qo=jnp.sum(jnp.abs(y)**2,axis=-1)
             ldo=2*jnp.sum(jnp.log(jnp.real(jnp.diagonal(Lo,axis1=-2,axis2=-1))),axis=-1)
             q,logdet=Model._set_own(q,qo),Model._set_own(logdet,ldo)
@@ -774,7 +776,8 @@ class Model(_Static):
         l=lmvn0(x[:,:,None,None,:]-mu[None,None],(cov+noiseCov[:,None])[None,None]) + Model._logpi(pi)[None,None]
         lAll=logsumexp(l,axis=-1)                                                # [ nStim_Ctg x nCtg x nCtg ]
         if bLeaveOneOut and det['pool'] is not None:
-            lAll=Model._mix_loo_pooled(x,Rm,noiseCov,RVar,weights,m,mu,det)
+            lAll=(Model._mix_loo_pooled_low_rank if Model._mix_loo_low_rank_ok(m) else Model._mix_loo_pooled)(
+                x,Rm,noiseCov,RVar,weights,m,mu,det)
         elif bLeaveOneOut:
             # own category without stimulus (l,k): remove its responsibility-weighted share a_c from each component
             a=jnp.transpose(det['r'],(1,0,2))                                    # [ l x k x nMix ]
@@ -834,6 +837,76 @@ class Model(_Static):
         noise=Model._noise_all(noiseCov,Model._noise_loo(noiseCov,RVar,weights,m))  # [ l x k x i x nF x nF ]
         lAll=logsumexp(lmvn0(x[:,:,None,None,:]-muL,covL+noise[:,:,:,None]) + Model._logpi(piL),axis=-1)
         return Model._add_own(lAll,Model._loo_prior(weights))
+
+    @staticmethod
+    def _mix_loo_low_rank_ok(m):
+        # whether pooled 'mix' leave-one-out can use _mix_loo_pooled_low_rank
+        return m.covRank is None and not (m.covShrink>0 and m.covTarget=='diag')
+
+    @staticmethod
+    def _mix_loo_pooled_low_rank(x,Rm,noiseCov,RVar,weights,m,mu,det):
+        """
+        _mix_loo_pooled without covRank or diagonal shrinkage. For the other categories (i != k), leaving out stimulus
+        (l,k) of weight 1 changes only the pooled statistics: P_i by K_ik dS and Q_i by K_ik (and the pooled target), with
+        dS = c_k dc dc^T the downdate of category k's scatter about its mean (c_k = N_k/(N_k-1)). Component c of category
+        i then has the covariance M = B_ikc - a_ikc dc dc^T with
+            B_ikc = (1-s) (S_ic + pi_ic P_i)/D_ikc + s sum_j Scat_j/(D-1) + ridge_i + noise_i,  D_ikc = den_ic + pi_ic (Q_i - K_ik)
+            a_ikc = c_k ((1-s) pi_ic K_ik/D_ikc + s/(D-1))
+        (an empty component keeps cov0_i, a = 0): one Cholesky factor per (i, k, c) instead of one per stimulus, as in
+        _loo_quad_all. The own category (i = k), whose responsibility-weighted component statistics change per stimulus, is
+        computed as in _mix_loo_pooled. Stim weights are 0 (padding, whose value is ignored) or 1.
+        """
+        pool=det['pool']
+        nF=x.shape[-1]
+        Nc,S,n=det['Nc'],det['S'],det['n']                                        # [ i x c ], [ i x c x nF x nF ], [ i ]
+        live=Nc>1e-8
+        den=jnp.where(live,jnp.maximum(Nc-1,Nc/2),1.)
+        pi=jnp.where(live,Nc,0.)/n[:,None]
+        K=pool['K']                                                              # [ i x k ], zero diagonal
+        s=m.covShrink                                                            # the pooled target (see _mix_loo_low_rank_ok)
+        Ssum=jnp.sum(pool['Scat'],axis=0)
+        DL=jnp.sum(pool['dof'])-1
+        Dn=den[:,None,:]+pi[:,None,:]*(pool['Q'][:,None]-K)[...,None]           # [ i x k x c ]
+        eye=jnp.eye(nF,dtype=x.dtype)
+        ridge=det['ridge'][:,None,None,None,None]*eye
+        B=(1-s)*(S[:,None]+pi[:,None,:,None,None]*pool['P'][:,None,None])/Dn[...,None,None] + s*Ssum/DL
+        B=jnp.where(live[:,None,:,None,None],B,det['cov0'][:,None,None]) + ridge + noiseCov[:,None,None]   # [ i x k x c x nF x nF ]
+        c=n/(n-1)
+        a=jnp.where(live[:,None,:],c[None,:,None]*((1-s)*pi[:,None,:]*K[...,None]/Dn + s/DL),0.)         # [ i x k x c ]
+        L=jnp.linalg.cholesky(B)
+        Li=_tri_inv(L)
+        o=(jnp.sum(Rm*weights,axis=1)/n).T                                        # [ k x nF ] category means
+        Rt=jnp.transpose(Rm,(1,2,0))                                              # [ l x k x nF ]
+        dc=Rt-o[None]
+        u=jnp.einsum('ikcfg,lkg->ikcfl',Li,dc)
+        z=jnp.einsum('ikcfg,lkg->ikcfl',Li,x)-jnp.einsum('ikcfg,icg->ikcf',Li,mu)[...,None]
+        aw=a[...,None]*weights.T[None,:,None,:]                                   # [ i x k x c x l ]: 0 for padding
+        dd=1-aw*jnp.sum(u**2,axis=3)
+        q=jnp.sum(z**2,axis=3)+aw*jnp.sum(u*z,axis=3)**2/dd
+        logdet=2*jnp.sum(jnp.log(jnp.diagonal(L,axis1=-2,axis2=-1)),axis=-1)[...,None]+jnp.log(dd)
+        lc=-q/2-nF/2*np.log(2*np.pi)-logdet/2 + Model._logpi(pi)[:,None,:,None]
+        lAll=jnp.transpose(logsumexp(lc,axis=2),(2,1,0))                          # [ l x k x i ]
+
+        # the own category: its components without the stimulus's responsibility-weighted share (as _mix_loo_pooled)
+        w=weights
+        ao=jnp.transpose(det['r'],(1,0,2))                                        # [ l x k x c ]
+        d=Rt[:,:,None,:]-mu[None]                                                 # [ l x k x c x nF ]
+        NL=Nc[None]-ao
+        liveL=NL>1e-8
+        NLs=jnp.where(liveL,NL,1.)
+        muL=mu[None]-(ao/NLs)[...,None]*d
+        SL=S[None]-(ao*Nc[None]/NLs)[...,None,None]*d[...,:,None]*d[...,None,:]
+        piL=jnp.where(liveL,NL,0.)/(n-w)[...,None]
+        T=None
+        if s>0:
+            dS=(w*n/(n-w))[...,None,None]*dc[...,:,None]*dc[...,None,:]         # [ l x k x nF x nF ]
+            T=((Ssum[None,None]-dS)/(jnp.sum(pool['dof'])-w)[...,None,None])[:,:,None]
+        ridgeo=det['ridge'][None,:,None,None,None]*eye
+        covL=Model._mix_cov(SL,jnp.where(liveL,jnp.maximum(NL-1,NL/2),1.),piL,pool,m,pool['P'][None],pool['Q'][None],T) + ridgeo
+        covL=jnp.where(liveL[...,None,None],covL,det['cov0'][None,:,None]+ridgeo)
+        noiseL=Model._noise_loo(noiseCov,RVar,weights,m)                          # [ l x k x nF x nF ]
+        own=logsumexp(lmvn0(x[:,:,None,:]-muL,covL+noiseL[:,:,None]) + Model._logpi(piL),axis=-1)
+        return Model._add_own(Model._set_own(lAll,own),Model._loo_prior(weights))
 
     @staticmethod
     def _full_terms(Rm,RVar,noiseCorr,weights):

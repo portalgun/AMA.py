@@ -283,8 +283,8 @@ class Nrn(_Static):
             out[k]=jnp.asarray(v,dtype=rd)
         return out
 
-    @partial(jit, static_argnames=['self','bGain'])
-    def main(self,rng,stim,f,weights=None,W=None,p=None,G=None,bGain=False):
+    @partial(jit, static_argnames=['self','bGain','bWithGain'])
+    def main(self,rng,stim,f,weights=None,W=None,p=None,G=None,bGain=False,bWithGain=False):
         """
         returns r, rNs, R, RNs, RVar
             r    mean response before normalization
@@ -295,7 +295,9 @@ class Nrn(_Static):
         with whitening, responses are flattened real dimensions [ nDim x nStim_Ctg x nCtg ] (see _flatten_responses).
         weights [ nStim_Ctg x nCtg ] mark the valid stimuli (for whitenType='response' and respBudget); W is a frozen
         whitening matrix; p the learned response-model parameters (a dict, see Nrn.params0; an array is the pooling
-        weights); G the respBudget gains to use (default: those of these stimuli). bGain: return the gains instead
+        weights); G the respBudget gains to use (default: those of these stimuli). bGain: return the gains instead.
+        bWithGain: return (outputs, gains), the gains None without respBudget (reference stimuli whose gains then scale
+        other stimuli, without a second pass for Nrn.gain)
         """
         rng_key1,rng_key2 = jxrandom.split(rng)
         if p is not None and not isinstance(p,dict):
@@ -336,7 +338,8 @@ class Nrn(_Static):
         # noisey output 2
         RNs = self._average_fun(self._noise_2_fun(RN,self.fano,self.var0,self.nSamples,rng_key2,self.rho))
 
-        return r,rNs,R,RNs,self._likelihood_variance(r,R,f,stim,M,G if self.respBudget is not None else None)
+        out=(r,rNs,R,RNs,self._likelihood_variance(r,R,f,stim,M,G if self.respBudget is not None else None))
+        return (out,G if self.respBudget is not None else None) if bWithGain else out
 
     def budget_gain(self,R,weights=None):
         # respBudget / the root mean square of each response dimension over the valid stimuli [ ... x 1 x 1 ]

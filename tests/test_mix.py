@@ -295,3 +295,28 @@ class TestMixturePooling:
         unit.train_new(1)
         h=np.asarray(unit.optimizer.loss_hist)
         assert np.all(np.isfinite(h)) and h[-1]<h[0]
+
+
+class TestMixturePooledLowRank:
+    """pooled 'mix' leave-one-out by rank-one updates for the other categories (Model._mix_loo_pooled_low_rank)"""
+
+    @pytest.mark.parametrize('bLooNoise',[True,False])
+    @pytest.mark.parametrize('kw',POOL[:3])
+    @pytest.mark.parametrize('gen',[ts.gaussian_ctg,ts.unequal_counts])
+    def test_matches_the_general_path(self,kw,bLooNoise,gen,monkeypatch):
+        unit,R,Rm,RVar,noiseCov=model_inputs('gss',gen=gen,n=2)
+        R=R+0.2*jnp.asarray(np.random.default_rng(0).standard_normal(R.shape))
+        m=ama.Model('mix',nMix=2,mixReg=1e-3,bLooNoise=bLooNoise,**kw)
+        m._Yperiod=None
+        assert ama.Model._mix_loo_low_rank_ok(m)
+        w=unit.stim.weights
+        fast=np.asarray(ama.Model._model__mix(R,Rm,RVar,noiseCov,None,w,True,m,unit.stim.Y))
+        monkeypatch.setattr(ama.Model,'_mix_loo_low_rank_ok',staticmethod(lambda m: False))
+        slow=np.asarray(ama.Model._model__mix(R,Rm,RVar,noiseCov,None,w,True,m,unit.stim.Y))
+        valid=np.asarray(w)>0
+        assert np.all(np.isfinite(fast[valid]))
+        assert np.allclose(fast[valid],slow[valid],rtol=1e-9,atol=1e-9)
+
+    def test_general_path_otherwise(self):
+        assert not ama.Model._mix_loo_low_rank_ok(ama.Model('mix',ctgPoolWidth=0.5,covRank=1))
+        assert not ama.Model._mix_loo_low_rank_ok(ama.Model('mix',ctgPoolWidth=0.5,covShrink=0.2))
