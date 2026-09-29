@@ -87,7 +87,9 @@ class Nrn(_Static):
                        only with their shape: learned normalization pools (bLearnNormPool) and second layers can not
                        shrink denominators or grow weights to beat the noise. Stage-1 noise carried through is scaled
                        likewise. Held-out stimuli are scaled by the training stimuli's gains (as whitening; see
-                       Unit.evaluate); with Optimizer batchSize, by each batch's.
+                       Unit.evaluate); with Optimizer batchSize, by each batch's. A complex response (quadrature pair, not
+                       whitened) is one dimension: its modulus has RMS respBudget (one gain keeps the pair's phase), so
+                       its real and imaginary components share respBudget^2 between them.
         readoutType  - pooling of the (normalized) responses across filters, with learned nonnegative weights p
                        (softplus of the parameters Unit.pool_p, normalized to sum 1), before stage-2 noise:
                        'None'
