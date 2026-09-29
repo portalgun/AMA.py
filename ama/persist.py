@@ -94,7 +94,7 @@ class _Persistence:
         """
         this unit's options and settings as a plain dict (yaml-safe): Nrn, Model, Objective and Optimizer settings, the
         seed, the filter layout, a summary of the training stimuli, and the training calls made so far (method and
-        arguments, from train_new / train_recurse / train_append / train_parametric / train_multiscale). Rebuild with
+        arguments, from train_new / train_recurse / train_append / train_schedule / train_parametric / train_multiscale). Rebuild with
         Unit.from_config. Learned filters are not included (use save / load).
         """
         cfg={'ama_config_version':CONFIG_VERSION,'ama_source_sha256':source_sha256(),'name':getattr(self,'name',None),
@@ -137,7 +137,7 @@ class _Persistence:
                     args['optimizer']=Optimizer(**args['optimizer'])
                 if args.get('dtype') is not None:
                     args['dtype']=jnp.dtype(args['dtype'])
-                if step['method'] not in ('train_new','train_recurse','train_append','train_parametric','train_multiscale'):
+                if step['method'] not in ('train_new','train_recurse','train_append','train_schedule','train_parametric','train_multiscale'):
                     raise Exception('unknown training method in config: ' + str(step['method']))
                 getattr(unit,step['method'])(**args)
         return unit

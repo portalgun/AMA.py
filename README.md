@@ -407,7 +407,12 @@ unit.train_recurse(ind_rec=None,...)
 ```
 Continue learning the current filters (or only those in `ind_rec`).
 
-`train_append` and `train_recurse` keep the current filters as they are parameterized, so they can not change `fourierType` or `bSplit` (they raise); `train_new` can. All three accept `stimVal` for early stopping (see Optimizer `patience`).
+```python
+unit.train_schedule(sizes,nRestarts=1,refineIter=None,...)
+```
+Learn groups of filters one after another, then refine them together: `train_new(sizes[0])`, `train_append(n)` for each later size, and `train_recurse` for `refineIter` iterations (default the optimizer's `nIterMax`; 0 skips it). With `nRestarts`, the whole schedule runs from that many random starts and the lowest cost is kept (`unit.restart_costs`). On the speed set, `train_schedule([2,2],nRestarts=8)` reaches an optimum that `train_new(4)` never did (see the training schedule results above).
+
+`train_append` and `train_recurse` keep the current filters as they are parameterized, so they can not change `fourierType` or `bSplit` (they raise); `train_new` can. All of them accept `stimVal` for early stopping (see Optimizer `patience`).
 
 ```python
 unit.train_parametric(n,family='morse',fourierType=2,bTied=True,orientations=None,init=None,stimVal=None,bPhase=False)

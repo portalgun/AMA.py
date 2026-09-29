@@ -379,12 +379,68 @@ class Unit(_Static,_Banks,_Evaluation,_Persistence,_Plotting):
             cost=float(self.loss) if stimVal is None else self.evaluate(stimVal)
             self.restart_costs.append(cost)
             if best is None or cost<best[0]:
-                best=(cost,jnp.asarray(self.filter.out),self.out_params,self.opt_state,self.rng_last,
-                      list(self.optimizer.loss_hist),list(self.optimizer.val_hist),self.optimizer.best_step,
-                      self._opt_param_shape,self._opt_state_key,self.pool_p,self.nrn_p,getattr(self.optimizer,'stop_reason',None))
-        (_,self.filter.out,self.out_params,self.opt_state,self.rng_last,self.optimizer.loss_hist,self.optimizer.val_hist,
-         self.optimizer.best_step,self._opt_param_shape,self._opt_state_key,self.pool_p,self.nrn_p,
-         self.optimizer.stop_reason)=best
+                best=(cost,self._snapshot())
+        self._restore(best[1])
+
+    def _snapshot(self):
+        # the trained state a restart leaves (filters, learned parameters, optimizer state and histories, keys)
+        o=self.optimizer
+        return dict(out=jnp.asarray(self.filter.out),last=self.filter.last,out_params=self.out_params,opt_state=self.opt_state,
+                    rng_last=self.rng_last,loss_hist=list(o.loss_hist),val_hist=list(o.val_hist),best_step=o.best_step,
+                    opt_param_shape=self._opt_param_shape,opt_state_key=self._opt_state_key,pool_p=self.pool_p,
+                    nrn_p=self.nrn_p,stop_reason=getattr(o,'stop_reason',None))
+
+    def _restore(self,snap):
+        o=self.optimizer
+        self.filter.out,self.filter.last=snap['out'],snap['last']
+        self.out_params,self.opt_state,self.rng_last=snap['out_params'],snap['opt_state'],snap['rng_last']
+        o.loss_hist,o.val_hist,o.best_step,o.stop_reason=snap['loss_hist'],snap['val_hist'],snap['best_step'],snap['stop_reason']
+        self._opt_param_shape,self._opt_state_key=snap['opt_param_shape'],snap['opt_state_key']
+        self.pool_p,self.nrn_p=snap['pool_p'],snap['nrn_p']
+
+    @_logged_training
+    def train_schedule(self,sizes,nRestarts=1,refineIter=None,fourierType=None,bSplit=None,stimInd=None,dtype=None,
+                       optimizer=None,stimVal=None):
+        """
+        learn groups of filters one after another, then refine them together: train_new(sizes[0]), train_append(n) for
+        each later size, and train_recurse for refineIter iterations (default: the optimizer's nIterMax; 0: no
+        refinement). With nRestarts, the whole schedule runs from nRestarts random starts and the run with the lowest
+        cost is kept (on stimVal if given, else on the training stimuli; costs in restart_costs). Incremental schedules
+        can reach optima that learning all filters jointly does not (on burgelab's speed set, [2, 2] with restarts does,
+        train_new(4) never did; see the README).
+        """
+        sizes=[int(n) for n in np.atleast_1d(sizes)]
+        if len(sizes)<1 or min(sizes)<1 or nRestarts<1:
+            raise Exception('sizes must be positive filter counts and nRestarts at least 1')
+        if optimizer is not None:
+            self.optimizer=optimizer
+        opt=self.optimizer
+        refine=opt.copy()
+        if refineIter is not None:
+            refine.nIterMax=int(refineIter)
+        rng0=self.rng
+        costs,best=[],None
+        try:
+            for i in range(nRestarts):
+                self.optimizer=opt
+                self.rng=rng0 if i==0 else jxrandom.fold_in(rng0,i)
+                self.rng_last=None
+                self.train_new(sizes[0],fourierType=fourierType,bSplit=bSplit,stimInd=stimInd,dtype=dtype,stimVal=stimVal)
+                for n in sizes[1:]:
+                    self.train_append(n,stimVal=stimVal)
+                if refine.nIterMax>0:
+                    self.train_recurse(optimizer=refine,stimVal=stimVal)
+                if nRestarts>1:
+                    # the snapshot while the last stage's optimizer is current: its histories are the run's last
+                    costs.append(float(self.loss) if stimVal is None else self.evaluate(stimVal))
+                    if best is None or costs[-1]<best[0]:
+                        best=(costs[-1],self._snapshot())
+        finally:
+            self.rng=rng0
+        if nRestarts>1:
+            self._restore(best[1])
+        self.optimizer=opt
+        self.restart_costs=costs if nRestarts>1 else None
 
     @_logged_training
     def train_new(self,n,fourierType=None,bSplit=None,stimInd=None,dtype=None,optimizer=None,nRestarts=1,stimVal=None):
@@ -392,6 +448,8 @@ class Unit(_Static,_Banks,_Evaluation,_Persistence,_Plotting):
         if optimizer is not None:
             self.optimizer=optimizer
         self.pool_p=self.nrn_p=None
+        if self.nrn.bFinalized:
+            self.filter.last=None                  # new filters: none are kept (Filter._finalize would extend the last ones)
 
         self._finalize(n,
                       np.arange(n),

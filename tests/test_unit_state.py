@@ -201,3 +201,44 @@ class TestReviewRegressions:
         with pytest.warns(UserWarning,match='respBudget') as rec:
             ama.Unit.load(tmp_path/'u.pkl',st)
         assert rec[0].filename==__file__
+
+
+class TestSchedule:
+    def test_one_run_equals_the_calls(self):
+        x,s,ci,Y,_=ts.gaussian_ctg()
+        st=ama.Stim(x,s,ci,Y)
+        a=mk(st,nIterMax=20)
+        a.train_schedule([1,1],refineIter=10)
+        b=mk(st,nIterMax=20)
+        b.train_new(1); b.train_append(1); b.train_recurse(optimizer=ama.Optimizer(nIterMax=10,lRate0=0.05,bVerbose=False))
+        assert np.allclose(np.asarray(a.out),np.asarray(b.out)) and np.isclose(float(a.loss),float(b.loss))
+        assert a.optimizer.nIterMax==20 and a.restart_costs is None
+        assert [c['method'] for c in a.train_log]==['train_schedule']
+
+    def test_restarts_keep_the_best_run(self):
+        x,s,ci,Y,_=ts.gaussian_ctg()
+        st=ama.Stim(x,s,ci,Y)
+        u=mk(st,nIterMax=15)
+        u.train_schedule([1,1],nRestarts=3,refineIter=5)
+        assert len(u.restart_costs)==3 and np.isclose(float(u.loss),min(u.restart_costs))
+        # the restarts are the schedule run from other keys, the first from the unit's own
+        v=mk(st,nIterMax=15)
+        v.train_schedule([1,1],refineIter=5)
+        assert np.isclose(u.restart_costs[0],float(v.loss))
+        assert len(set(np.round(u.restart_costs,8)))>1
+
+    def test_config_replay(self):
+        x,s,ci,Y,_=ts.gaussian_ctg()
+        st=ama.Stim(x,s,ci,Y)
+        u=mk(st,nIterMax=10)
+        u.train_schedule([1,1],nRestarts=2,refineIter=5)
+        w=ama.Unit.from_config(u.config(),st,bTrain=True)
+        assert np.allclose(np.asarray(w.out),np.asarray(u.out))
+
+    @pytest.mark.parametrize('n',[1,3])
+    def test_train_new_after_recurse_discards_the_filters(self,n):
+        u=mk(nIterMax=5)
+        u.train_new(2)
+        u.train_recurse()
+        u.train_new(n)
+        assert np.shape(u.out)[-1]==n and u.last is None
