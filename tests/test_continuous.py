@@ -204,7 +204,7 @@ class TestWithin:
         for a in range(3):
             for b in range(4):
                 o=np.argsort(np.asarray(Yc)[a,b])
-                assert np.isclose(med[a,b],np.interp(0.5,np.cumsum(p[a,b][o]),np.asarray(Yc)[a,b][o]))
+                assert np.isclose(med[a,b],np.interp(0.5,np.cumsum(p[a,b][o])-p[a,b][o]/2,np.asarray(Yc)[a,b][o]))
 
     def test_heldout_estimates_match_evaluate(self):
         st,_,_=binned(nStim=200)

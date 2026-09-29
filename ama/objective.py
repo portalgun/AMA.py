@@ -163,10 +163,16 @@ class Objective(_Static):
         return lpost
 
     @staticmethod
+    def _mid_cdf(p):
+        # the cdf at the middle of each point mass (ascending order): interpolating it at 0.5 gives y_k for a posterior
+        # concentrated at y_k (the cdf after each mass would give the midpoint between y_k-1 and y_k)
+        return jnp.cumsum(p,axis=-1)-p/2
+
+    @staticmethod
     def _wmedian(p,y):
         # median of point masses p at y (both [ ... x n ]), per row
         order=jnp.argsort(y,axis=-1)
-        cdf=jnp.cumsum(jnp.take_along_axis(p,order,axis=-1),axis=-1)
+        cdf=Objective._mid_cdf(jnp.take_along_axis(p,order,axis=-1))
         return jnp.vectorize(lambda c,v: jnp.interp(0.5,c,v),signature='(n),(n)->()')(cdf,jnp.take_along_axis(y,order,axis=-1))
 
     @staticmethod
@@ -177,7 +183,7 @@ class Objective(_Static):
             return Objective._median_within(p,Y,per,Yc)
         def median(y):
             order=jnp.argsort(y)
-            cdf=jnp.cumsum(p[...,order],axis=-1)
+            cdf=Objective._mid_cdf(p[...,order])
             return jnp.vectorize(lambda c: jnp.interp(0.5,c,y[order]),signature='(n)->()')(cdf)
         def circ_median(y,P):
             # the circular median m minimizes the expected wrapped distance, and the diameter through m halves the
@@ -188,7 +194,7 @@ class Objective(_Static):
             m0=lax.stop_gradient(cand[jnp.argmin(p@dist,axis=-1)])                 # [ ... ]
             yu=m0[...,None]+_wrap(y-m0[...,None],(P,))                             # [ ... x nCtg ]
             order=jnp.argsort(yu,axis=-1)
-            cdf=jnp.cumsum(jnp.take_along_axis(p,order,axis=-1),axis=-1)
+            cdf=Objective._mid_cdf(jnp.take_along_axis(p,order,axis=-1))
             ys=jnp.take_along_axis(yu,order,axis=-1)
             return _wrap(jnp.vectorize(lambda c,v: jnp.interp(0.5,c,v),signature='(n),(n)->()')(cdf,ys),(P,))
         if Y.ndim==1:

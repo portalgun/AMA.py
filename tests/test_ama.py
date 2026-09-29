@@ -252,7 +252,17 @@ class TestLikelihood:
         lp=jnp.log(p)[None]
         assert np.isclose(ama.Objective._est__mean(lp,Y)[0],p@Y)
         assert np.isclose(ama.Objective._est__mode(lp,Y)[0],3.)
-        assert np.isclose(ama.Objective._est__median(lp,Y)[0],np.interp(0.5,np.cumsum(p),Y))
+        assert np.isclose(ama.Objective._est__median(lp,Y)[0],np.interp(0.5,np.cumsum(p)-p/2,Y))
+
+    def test_median_of_a_concentrated_posterior_is_its_level(self):
+        # a posterior (nearly) all at one level has that level as its median, and a uniform one the middle
+        Y=jnp.array([0.,1.,2.,3.,4.])
+        for k in range(5):
+            p=np.full(5,1e-9); p[k]=1
+            assert np.isclose(ama.Objective._est__median(jnp.log(p/p.sum())[None],Y)[0],Y[k],atol=1e-6)
+            assert np.isclose(ama.Objective._est__median(jnp.log(p/p.sum())[None],Y,(10.,))[0],Y[k],atol=1e-6)
+            assert np.isclose(ama.Objective._wmedian(jnp.asarray(p/p.sum())[None],Y[None])[0],Y[k],atol=1e-6)
+        assert np.isclose(ama.Objective._est__median(jnp.log(jnp.full(4,0.25))[None],Y[:4])[0],1.5)
 
     def test_objective_defaults_follow_cost(self):
         assert ama.Objective('l2').estType=='mean'

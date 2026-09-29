@@ -96,7 +96,7 @@ class TestEstimatorsAndErrors:
         for d in range(2):
             o=np.argsort(np.asarray(Y)[:,d])
             for r in range(4):
-                assert np.isclose(med[r,d],np.interp(0.5,np.cumsum(p[r,o]),np.asarray(Y)[o,d]))
+                assert np.isclose(med[r,d],np.interp(0.5,np.cumsum(p[r,o])-p[r,o]/2,np.asarray(Y)[o,d]))
 
     def test_errors_sum_over_dimensions_and_wrap(self):
         yHat=jnp.array([[[170.,1.],[0.,3.]]])
@@ -409,7 +409,7 @@ class TestCircularMedian:
         m0=cand[np.argmin([(p*np.abs(wrap(Y-c))).sum() for c in cand])]
         yu=m0+wrap(Y-m0)
         o=np.argsort(yu)
-        return wrap(np.interp(0.5,np.cumsum(p[o]),yu[o]))
+        return wrap(np.interp(0.5,np.cumsum(p[o])-p[o]/2,yu[o]))
 
     def test_matches_reference(self):
         rng=np.random.default_rng(0)
