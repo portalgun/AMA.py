@@ -366,3 +366,13 @@ class TestPooledLowRankLeaveOneOut:
         for kw in (dict(ctgPoolWidth=0.5,bPoolMeans=True),dict(ctgPoolWidth=0.5,covRank=1),dict(ctgPoolWidth=0.5,covShrink=0.2),
                    dict(covShrink=0.2),dict()):
             assert not ama.Model._loo_pooled_low_rank(ama.Model('gss','mean',bLeaveOneOut=True,**kw))
+
+
+def test_noise_free_leave_one_out_trains():
+    """rho=None (no noise): the left-out noise scale of a zero variance is 1, not sqrt(0), whose gradient made training NaN"""
+    for kw in (dict(),dict(ctgPoolWidth=0.5)):
+        x,s,ci,Y,_=ts.gaussian_ctg()
+        unit=ama.Unit(ama.Stim(x,s,ci,Y),ama.Nrn(rho=None,var0=0.,fano=0.),ama.Model('gss','mean',bLeaveOneOut=True,**kw),
+                      ama.Objective('map'),ama.Optimizer(nIterMax=20,lRate0=0.05,bVerbose=False))
+        unit.train_new(2)
+        assert np.all(np.isfinite(np.asarray(unit.optimizer.loss_hist))) and np.all(np.isfinite(np.asarray(unit.out)))

@@ -407,7 +407,9 @@ class Model(_Static):
         v=(jnp.sum(RVar*weights,axis=1)/wc).T                                     # [ nCtg x nF ]
         w=weights[...,None]
         vL=(wc[None,:,None]*v[None]-w*jnp.transpose(RVar,(1,2,0)))/(wc[None,:,None]-w)
-        sc=jnp.sqrt(_safe_divide(vL,v[None]))
+        # a zero mean variance (no noise) keeps its scale 1: sqrt(0)'s infinite derivative times a zero cotangent is NaN
+        pos=v[None]>0
+        sc=jnp.sqrt(jnp.where(pos,vL/jnp.where(pos,v[None],1),1.))
         return noiseCov[None]*sc[...,:,None]*sc[...,None,:]
 
     @staticmethod

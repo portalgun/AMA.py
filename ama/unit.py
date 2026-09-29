@@ -221,6 +221,12 @@ class Unit(_Static,_Banks,_Evaluation,_Persistence,_Plotting):
                 raise Exception('nNeighbors and nRef are alternatives; set one of them')
         if self.model.bWithin and not getattr(self.stim,'bContinuous',False):
             raise Exception('bWithin estimates within categories from the stimuli\'s own latent values: give Stim y (e.g. Stim.binned)')
+        if self.model.bWithin and self.model.modelType!='full':
+            # the within-category regression uses each category's own (unpooled) covariance, left out with bLeaveOneOut
+            nMin=3 if self.model.bLeaveOneOut else 2
+            if np.any(counts<nMin):
+                raise Exception('bWithin needs at least ' + str(nMin) + ' stimuli in every category for its within-category '
+                                'regression (fewest: ' + str(int(counts.min())) + ')')
         if self.model.modelType=='full' and self.model.bLeaveOneOut and self.model.nRef is not None and self.model.nRef<2:
             raise Exception('bLeaveOneOut with nRef needs nRef of at least 2')
         if self.model.modelType=='mix':

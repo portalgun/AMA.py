@@ -279,3 +279,15 @@ class TestWithinLeaveOneOut:
         C=np.stack([[np.cov(Ri[f],yi[:,dd])[0,1] for dd in range(2)] for f in range(Ri.shape[0])])
         ref=yi.mean(0)+(R[:,l,k]-Ri.mean(1))@np.linalg.solve(np.cov(Ri)+N,C)
         assert np.allclose(np.asarray(Yc)[l,k,k],ref,rtol=1e-8)
+
+
+@pytest.mark.parametrize('nLast,loo',[(1,False),(2,True)])
+def test_within_rejects_categories_too_small_for_its_regression(nLast,loo):
+    x,s,y,_=ts.continuous_gaussian(nStim=200)
+    ys=np.sort(y)
+    edges=np.r_[np.quantile(y,[0,.25,.5,.75]),(ys[-nLast-1]+ys[-nLast])/2,ys[-1]+1]
+    st=ama.Stim.binned(x,s,y,edges=edges)
+    u=ama.Unit(st,ama.Nrn(),ama.Model('gss','mean',ctgPoolWidth=0.5,bLeaveOneOut=loo,bWithin=True),ama.Objective('l2'),
+               ama.Optimizer(nIterMax=1,bVerbose=False))
+    with pytest.raises(Exception,match='bWithin needs at least'):
+        u._finalize(2,np.arange(2),dtype=jnp.float64)
