@@ -55,9 +55,29 @@ On both sets, the AMA-Gauss cost of burgelab's filters matches their reported co
 | 'gss', `ctgPoolWidth` one level | 2.038 / 2.039 / 6.83 | 1.937 / 1.943 / 2.15 |
 | 'student', `df=5` | **1.815 / 1.830 / 6.79** | **1.676 / 1.698 / 1.83** |
 | 'mix', `nMix=2` | 1.949 / 1.966 / 6.99 | 1.838 / 1.850 / 2.15 |
-| 'full' | 1.895 / 1.984 / 7.15 | 1.810 / 1.850 / 1.95 |
+| 'full' | 1.895 / 1.984 / 7.15 | 1.806 / 1.842 / 2.13 |
+| 'full', `bLeaveOneOut` | 1.984 / 1.977 / 7.00 | 1.847 / 1.848 / 1.99 |
 
-The heavy-tailed 'student' likelihood decodes both sets best; full AMA fits its training set most closely and generalizes worse than 'gss' on disparity; shrinkage and pooling cost accuracy at these sizes (500 or more stimuli per level).
+The heavy-tailed 'student' likelihood decodes both sets best; full AMA fits its training set most closely and generalizes worse than 'gss' on disparity; shrinkage and pooling cost accuracy at these sizes (500 or more stimuli per level). Leave-one-out removes full AMA's optimism (its training cost then matches the held-out cost) but improves the held-out cost little: its gap to 'gss' on disparity is not from scoring each stimulus against itself.
+
+Most of the Student t's advantage is in decoding, not in the filters. Filters trained under one likelihood and decoded held out with each (same setup; costs / rmse):
+
+| trained with | disparity: decoded 'gss' | decoded 'student' | speed: decoded 'gss' | decoded 'student' |
+|---|---|---|---|---|
+| 'gss' | 1.968 / 7.04 | 1.834 / 6.84 | 1.854 / 2.16 | **1.692** / 1.92 |
+| 'student', `df=5` | 1.973 / 7.02 | **1.830 / 6.79** | 1.870 / 2.07 | 1.698 / **1.83** |
+
+Decoding AMA-Gauss filters with the Student t gains 0.13-0.16; training under it changes the cost by less than 0.01 either way (it lowers the speed rmse from 1.92 to 1.83).
+
+Training schedule (AMA-Gauss, held-out costs over seeds 1-5, the same 2,400 steps for each schedule): learning all 4 filters jointly (`train_new(4)`), 2 then 2 more (`train_new(2)`, `train_append(2)`, `train_recurse()`), or one at a time then refined:
+
+| schedule | disparity: mean / best | speed: mean / best |
+|---|---|---|
+| joint | 1.968 / 1.968 | 1.856 / 1.826 |
+| 2+2, refined | 1.978 / 1.968 | 1.837 / 1.826 |
+| 1+1+1+1, refined | 2.011 / 1.968 | 1.853 / 1.826 |
+
+On disparity joint training finds the same optimum from every start, while one filter at a time stays in a worse one (2.02) in 4 of 5 seeds even after refining all four. On speed every schedule reaches 1.826 from some start, but joint training does so in only 1 of 5: restarts (`nRestarts`) matter more there than the schedule.
 
 ## Example Use
 The runnable version of this example is [examples/quickstart.py](examples/quickstart.py).
@@ -535,7 +555,8 @@ Known limitations
   stimulus-dependent variances but a fixed correlation structure
 - scaling: without covRank, AMA-Gauss needs more stimuli per category than response dimensions
 - encoder: linear unit-norm filters with a fixed-shape nonlinearity (learned offsets with bBias) and learned
-  unit-norm layers after them (readoutType 'linear', nReadout a tuple of widths) with one activation; `train_append` is greedy and the objective is nonconvex (restarts help)
+  unit-norm layers after them (readoutType 'linear', nReadout a tuple of widths) with one activation; `train_append` is greedy and the objective is nonconvex (restarts help; see the training schedule table: one filter at a time
+  ends in a worse optimum on disparity)
 - learned normalization pools and second-layer weights: without Nrn respBudget, the fixed additive noise rewards larger
   responses, which the unit-norm/row-sum constraints do not prevent (on the disparity set most of a learned pool's gain);
   training them without a budget warns
