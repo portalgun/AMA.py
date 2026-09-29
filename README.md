@@ -447,7 +447,7 @@ Every call to `train_new`, `train_recurse`, `train_append`, `train_parametric` a
 - `ama.Unit.from_config('unit.yaml', stim, bTrain=False, stimVal=None)` - build a unit from a yaml file (or dict) with these stimuli; `bTrain=True` replays the recorded training calls, passing `stimVal` to the calls that had validation stimuli. Unknown top-level keys (e.g. project metadata) are ignored
 - `ama.config_from_saved('unit.pkl')` - the configuration of a saved unit, without loading stimuli
 - `ama.load_config('unit.yaml')` - read a configuration file
-- `ama.source_sha256()` - hash of the `ama.py` source; configs and saved units record it (`ama_source_sha256`), since optimization paths can differ numerically between code versions
+- `ama.source_sha256()` - hash of the package's source files; configs and saved units record it (`ama_source_sha256`), since optimization paths can differ numerically between code versions
 
 ```python
 unit.save_config('unit.yaml')                                   # after training
@@ -472,7 +472,7 @@ unit.save_config('unit.yaml')               # the settings and training calls al
 ```
 `save` also keeps the unit's `name`, its `train_log` (the training calls), the bank metadata of `train_multiscale` /
 `train_parametric` (so `multiscale_values()` / `parametric_values()` work after `load`), the pooling weights, and
-`ama.source_sha256()`, the hash of the `ama.py` that trained it.
+`ama.source_sha256()`, the hash of the package source that trained it.
 
 #### Properties
 - `unit.out` - learned filters
@@ -509,6 +509,7 @@ stim.plot()                        # a stimulus
 ```
 
 ## Notes on hacking
+The package `ama/` has one module per stage: `_base.py` (shared imports, densities, latent geometry, `_Static`, `_TypeFunc`, configuration helpers), `stim.py` (`Stim`, `_Index`, `Filter`), `nrn.py`, `model.py`, `objective.py`, `optimizer.py`, and `unit.py` (`Unit`, `Response`). Each module starts with `from ._base import *`, whose `__all__` includes the private helpers, and `import ama` re-exports every class and helper. Module constants live where they are used (e.g. `ama.model._FULL_CHUNK`), so patch them there.
 To aid autograd and jit, learning routines do not contain `if` statements on options.
 Instead, the objective is composed before execution: the `_TypeFunc` descriptor binds the function for an option when the option is set (e.g. setting `normalizeType='broad'` binds `_normalize__broad`).
 The configuration objects are static arguments of jitted functions, keyed by their settings (`_key()`), so a changed setting compiles a new trace; add new settings that change the math to `_key()`.
@@ -544,7 +545,8 @@ Known limitations
 - full AMA: nNeighbors still searches all pairs once per chunk (O(N^2), chunked), and without batches is no faster than
   exact full AMA below ~10,000 stimuli on a GPU; with batchSize every stimulus's responses are still computed each
   iteration
-- engineering: ama.py is a single ~5000 line module
+- engineering: `ama/unit.py` (~1,750 lines) still holds training, the generated filter banks, evaluation, saving and
+  plotting together
 
 V2
 - deeper encoders beyond stacked readout layers (e.g. learned nonlinearities, convolutional structure)

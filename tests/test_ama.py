@@ -289,7 +289,7 @@ def test_burgelab_reference_cost(reference_mat):
 
 def ama_path(name):
     import os
-    return os.path.join(os.path.dirname(ama.__file__),name)
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(ama.__file__))),name)
 
 
 #- filter indexing

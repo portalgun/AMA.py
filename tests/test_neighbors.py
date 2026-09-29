@@ -63,7 +63,7 @@ class TestSearch:
     def test_chunked_search_is_identical(self,monkeypatch):
         unit=full_unit(nNeighbors=6,bLeaveOneOut=True)
         a=lrn_parts(unit,jax.random.key(0))[0]
-        monkeypatch.setattr(ama,'_FULL_CHUNK',7*unit.stim.weights.size)
+        monkeypatch.setattr(ama.model,'_FULL_CHUNK',7*unit.stim.weights.size)
         u=full_unit(nNeighbors=6,bLeaveOneOut=True)
         b=lrn_parts(u,jax.random.key(0))[0]
         assert np.array_equal(np.sort(a,-1),np.sort(b,-1))
@@ -71,7 +71,7 @@ class TestSearch:
         out=u._nrn_out()
         lik=lambda: np.asarray(u._likelihoods(out,u.stim.weights,u.stim.Y,jax.random.key(2),nbr=jnp.asarray(a)))
         chunked=lik()
-        monkeypatch.setattr(ama,'_FULL_CHUNK',2**24)
+        monkeypatch.setattr(ama.model,'_FULL_CHUNK',2**24)
         assert np.allclose(chunked,lik(),rtol=1e-12)
 
 

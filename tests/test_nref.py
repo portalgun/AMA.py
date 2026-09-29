@@ -102,7 +102,7 @@ class TestChunks:
         R,Rm,RVar=[ama._flatten_responses(x) for x in unit.model._response_fun(*out)]
         args=(R,Rm,RVar,None,None,unit.stim.weights,bLeaveOneOut,unit.model,unit.stim.Y)
         whole=np.asarray(ama.Model._model__full(*args))
-        monkeypatch.setattr(ama,'_FULL_CHUNK',7*30*3)              # 7 observed stimuli per chunk, 30 x 3 references
+        monkeypatch.setattr(ama.model,'_FULL_CHUNK',7*30*3)              # 7 observed stimuli per chunk, 30 x 3 references
         chunked=np.asarray(ama.Model._model__full(*args))
         assert np.array_equal(np.isinf(whole),np.isinf(chunked))
         assert np.allclose(whole[np.isfinite(whole)],chunked[np.isfinite(chunked)],rtol=1e-12)
@@ -114,7 +114,7 @@ class TestChunks:
         f0=unit.filter.out_flat
         loss=lambda f: unit._loss_fun({'f':f},unit.rng,unit.stim.val,unit.stim.weights,unit.stim.yCtg,unit.stim.Y)
         g=np.asarray(jax.grad(loss)(f0))
-        monkeypatch.setattr(ama,'_FULL_CHUNK',7*30*3)
+        monkeypatch.setattr(ama.model,'_FULL_CHUNK',7*30*3)
         unit2=full_unit(bLeaveOneOut=bLeaveOneOut)
         out=lambda f: unit2.nrn.main(unit2.rng,unit2.stim.val,f,unit2.stim.weights)
         def chunked(f):
