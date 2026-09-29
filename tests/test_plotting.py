@@ -63,9 +63,10 @@ def test_embedding_methods_and_fourier_stimuli(tmp_path):
         assert (tmp_path/(method+'.png')).exists() and ('response '+title) in fig._suptitle.get_text()
     with pytest.raises(Exception,match='method must be'):
         unit.plot_response_embedding(spatial,'umap')
-    # the training stimuli are in the fourier domain after finalize: the embedding transforms them back
-    assert stim.bIsFourier
-    unit.plot_response_embedding(stim,'tsne',nMax=60,perplexity=5)
+    # the unit's training stimuli are in the fourier domain after finalize (the caller's stay spatial): the embedding
+    # transforms them back
+    assert unit.stim.bIsFourier and not stim.bIsFourier
+    unit.plot_response_embedding(unit.stim,'tsne',nMax=60,perplexity=5)
     unit.save_figures(tmp_path/'all',spatial,methods={'tsne':{'perplexity':5},'pacmap':{},'phate':{}},nMax=90)
     assert all((tmp_path/('all_'+m+'.png')).exists() for m in ('filters','tsne','pacmap','phate','embeddings'))
     fig=unit.plot_response_embeddings(spatial,('tsne','phate'),tmp_path/'two.png',name='both',nMax=90,

@@ -147,7 +147,7 @@ class TestLeaveOneOut:
         assert np.isfinite(float(unit.loss))
 
     @pytest.mark.parametrize('modelType,errType,counts,match',[
-        ('gss','map',(10,30,20),'only implemented'),
+        ('gss','map',(2,30,20),'at least 3'),
         ('full','mle',(10,30,20),'mle'),
         ('full','map',(1,30,20),'at least 2'),
     ])

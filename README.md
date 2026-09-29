@@ -24,12 +24,11 @@ For binocular images, filters can be split into sub-filters (one per eye).
 ## Installation
 ```
 git clone https://github.com/portalgun/AMA.py
-git clone https://github.com/portalgun/Filter.py
 cd AMA.py
 pip install jax optax numpy scipy matplotlib scikit-learn pyyaml pytest
 pip install pacmap phate                   # optional: PaCMAP and PHATE response embeddings
-export PYTHONPATH=$PWD/../Filter.py        # Filter.py is not pip-installable yet
 ```
+`Filter.py` in this repository holds the parts of [Filter](https://github.com/portalgun/Filter.py) that ama uses (the sample grid `Filter.X` and `plotFT`), so the full package is not needed.
 For NVIDIA GPUs, install `jax[cuda12]` instead of `jax`.
 
 Run the tests from the repository root with `python -m pytest tests` (about a minute on a CPU).
@@ -91,12 +90,16 @@ Arrays with a stimulus axis (e.g. `unit.estimates()`) are grouped the same way, 
 stim=ama.Stim(x,                        # Filter.X meshgrid of the stimulus (e.g. Filter.X(ndim=1,n=64,totS=1))
               stimuli,                  # [ *dims x nStim ]
               yCtgInd,                  # [ nStim ] category label of each stimulus (any integer coding)
-              Y,                        # [ nCtg ] latent variable value of each category, in sorted label order
+              Y,                        # [ nCtg ] or [ nCtg x nDim ] latent value(s) of each category, in sorted label order
               bStimIsFourier=False,     # whether stimuli are in the fourier domain
               nSplit=0,                 # number of parts for split filters (e.g. 2 for the two eyes)
               bStimIsSplit=False,       # whether stimuli are already split
-              bContrastNormalize=False) # contrast normalize the stimuli
+              bContrastNormalize=False, # contrast normalize the stimuli
+              Yperiod=None)             # period of circular latent variables
 ```
+Several latent dimensions (`Y [ nCtg x nDim ]`, e.g. disparity and speed) are estimated jointly: each category is one combination of values. Estimates then carry a last axis of length `nDim`, `'l1'`/`'l2'` sum over the dimensions, `'mean'` and `'median'` estimate each dimension, and `performance` reports bias, sd and rmse per dimension.
+
+`Yperiod` makes latent variables circular (e.g. `180` for orientation in degrees, `2*np.pi` for phase): one value for every dimension, or one per dimension with `None` for the linear ones. All distances between latent values wrap: errors, `'mean'` (the circular mean), the divergence targets, 'wasserstein' and 'fisher' (on the circle), and `ctgPoolWidth` pooling. `'median'` is the circular median there: the diameter through it halves the posterior probability, and it minimizes the expected wrapped distance.
 AMA assumes contrast-normalized stimuli (zero mean, unit norm); `Stim` warns otherwise. Use `bContrastNormalize=True` or `ama.contrast_normalize(stimuli)`.
 For split stimuli, the parts are contiguous blocks of the first stimulus dimension (e.g. left eye then right eye).
 
@@ -116,7 +119,7 @@ nrn=ama.Nrn(fano=1.36,             # fano factor
             activationType='None', # response nonlinearity
             bNoise_1=False,        # sample noise before normalization
             bNoise_2=False,        # sample noise after normalization
-            rho=0,                 # noise correlation
+            rho=0,                 # noise correlation: a number, or a correlation matrix
             averageType='full',    # how noise samples are combined
             nSamples=1,            # noise samples per response
             whitenType='None',     # population whitening before noise
@@ -139,13 +142,15 @@ readoutType - pooling of the (normalized) responses across filters with learned 
 
 activationType - 'None', 'relu', 'softplus', 'abs', 'logistic', 'swish', 'swish2', 'tanh', 'gauss', 'igauss' (applied to real and imaginary parts separately)
 
-Noise - the likelihood always uses noise of variance `fano*|R| + var0` on the final responses, also when no noise is sampled (`responseType='mean'`, the mean-response approximation of Burge & Jaini 2017).
-Noise sampled before normalization (`bNoise_1`) is carried through the normalization: exactly for 'broad' and 'narrow', to first order for 'gen'.
+Noise - the likelihood always uses noise of variance `fano*|R| + var0` on the final responses, also when no noise is sampled (`responseType='mean'`, the mean-response approximation of Burge & Jaini 2017). With `responseType='basic'` the decoded responses are noisy samples, so the cost is a Monte Carlo estimate of the expected cost over the noise (more samples per step with `nSamples` and `averageType`).
+Noise sampled before normalization (`bNoise_1`) is carried through the normalization: exactly for 'broad' and 'narrow', to first order for 'gen', and not at all through 'phase', which is not linear (rejected).
+`var0` must be positive whenever noise is modeled (`rho` not None): responses of 0 (padding, or zeroed by an activation) would otherwise have zero variance.
 
 rho - noise correlation
 - None = no noise (only with `modelType='gss'`)
 - 0 = independent noise
-- otherwise, correlates the noise of all response dimensions (filters, sub-filters, and real/imaginary components) equally
+- a number: correlates the noise of all response dimensions (filters, sub-filters, and real/imaginary components) equally
+- a correlation matrix `[ nDim x nDim ]` (symmetric, unit diagonal, positive definite): the correlation of each pair of response dimensions, in sampling and in the likelihood. Dimensions are ordered as the flattened responses: the real parts of all filters (sub-filters within each filter), then the imaginary parts (`fourierType=2`)
 
 averageType - with `nSamples > 1`: 'full' (a single sample), 'mean', 'log_mean', or 'median' of the samples
 
@@ -167,13 +172,21 @@ The likelihood of the responses given each level of the latent variable
 ```python
 model=ama.Model(modelType='gss',       # likelihood model
                 responseType='basic',  # which responses are decoded
-                bLeaveOneOut=False,    # full AMA: leave each decoded stimulus out of its own category
+                bLeaveOneOut=False,    # leave each decoded stimulus out of its own category
                 covShrink=0.,          # shrink category covariances toward covTarget (0-1)
                 covTarget='diag',      # 'diag' or 'pooled'
                 df=5.,                 # degrees of freedom for modelType='student'
                 ctgPoolWidth=None,     # pool category statistics over neighbouring Y (kernel width in units of Y)
                 bPoolMeans=False,      # also pool the category means
-                circMean='estimate')   # modelType='circ': 'estimate' or 'zero' (unknown complex gain)
+                circMean='estimate',   # modelType='circ': 'estimate' or 'zero' (unknown complex gain)
+                nMix=2,                # modelType='mix': gaussian components per category
+                nEM=20,                #   EM iterations
+                mixReg=1e-3,           #   ridge on the component covariances (relative to the category variance)
+                bWarmEM=False,         #   while training, start EM from the previous iteration's fit
+                nEMWarm=3,             #   and run this many EM iterations
+                nRef=None,             # modelType='full': reference stimuli per category while training (None = all)
+                covRank=None,          # low-rank (factor analysis) category covariances: number of factors
+                nFA=50)                #   EM iterations of the factor analysis fit
 ```
 
 modelType
@@ -181,6 +194,12 @@ modelType
 - 'full' - the original AMA: each category's likelihood is the average over its stimuli of the noisy response distribution to each stimulus (Burge & Jaini 2017, Eq 5)
 - 'student' - as 'gss', with a multivariate student t of `df` degrees of freedom (df > 2) whose covariance matches the category covariance plus noise: heavy tails, as natural-image responses have
 - 'circ' - a circular (proper) complex gaussian on quadrature-pair responses (fourierType=2, no whitening): hermitian category covariances, so half the parameters of 'gss' on the real and imaginary parts, and circular symmetry built in. With `circMean='zero'` the category mean is fixed at zero and the covariance is the second moment `E[R R^H]`: the likelihood when each stimulus's complex gain (contrast and phase, e.g. edge polarity or feature type) is unknown, `R = G m + noise`
+
+- 'mix' - a gaussian mixture per category with `nMix` components, `p(R|X_i) = sum_c pi_ic N(R; mu_ic, Sigma_ic + noise)`: for responses that are multimodal within a category (e.g. sign or phase flips from nuisance variables), between the single gaussian of 'gss' and the O(N^2) cost of 'full'. The mixture is fit to each category's mean responses by `nEM` EM iterations inside the cost, initialized by quantiles along the category's first principal axis, and differentiated through, so the gradient includes how the fit moves with the filters. `nMix=1` with `mixReg=0` is 'gss'. With `bWarmEM=True`, each training iteration starts EM from the previous iteration's (maximum likelihood) fit and runs only `nEMWarm` iterations; the fit carries across batches, and `unit.loss`/`evaluate` still fit from scratch with `nEM`. `bLeaveOneOut` removes the stimulus's responsibility-weighted share from its own category's components, holding the responsibilities of the full fit fixed. `covRank` applies to the component covariances. Needs at least `2*nMix` stimuli per category (also per batch); not with `ctgPoolWidth` or `covShrink`.
+
+covRank ('gss', 'student', 'mix') - each category (or mixture component) covariance is a factor analysis model `L L^T + Psi`, with `covRank` factors and a diagonal `Psi`, fit to its sample covariance by `nFA` EM iterations (Ghahramani & Hinton 1996) inside the cost and differentiated through. With many response dimensions and few stimuli per category, it generalizes much better than the sample covariance (which needs more stimuli than dimensions). `covRank=0` is a diagonal covariance. It applies before `covShrink`, and to the left-out covariances of `bLeaveOneOut`.
+
+nRef ('full') - while training, each stimulus is decoded against `nRef` reference stimuli per category, drawn at random every iteration, instead of all of them: O(N nRef) instead of O(N^2) per iteration, for large training sets. The training cost is then a stochastic estimate of full AMA's (slightly pessimistic, the log of a sample mean); `unit.loss`, `evaluate` and `performance` still decode against all training stimuli. Combines with `batchSize` (references are drawn from the batch) and `bLeaveOneOut`.
 
 Category statistics ('gss', 'student', 'circ'):
 - covShrink, covTarget - each category covariance becomes `(1-covShrink) Sigma + covShrink T`, with T its own diagonal ('diag') or the count-weighted mean covariance over categories ('pooled'), before the noise covariance is added. Stabilizes covariances estimated from few stimuli per response dimension.
@@ -190,8 +209,11 @@ responseType
 - 'mean' - decode mean responses (noise enters through the likelihood)
 - 'basic' - decode noisy responses
 
-bLeaveOneOut - with 'full', each decoded stimulus otherwise matches its own mean response, which makes the cost optimistic when noise is low or categories (or batches) are small.
-With `bLeaveOneOut=True`, the posterior is Eq 5 with the decoded stimulus removed from the training set. Not available with `errType='mle'`.
+bLeaveOneOut - the likelihoods are fit to the stimuli they score, so each stimulus is otherwise decoded against statistics that include it. That makes the training cost optimistic when noise is low, filters are many, or categories (or batches) are small. With `bLeaveOneOut=True`:
+- 'full' - the posterior is Eq 5 with the decoded stimulus removed from the training set
+- 'gss', 'student', 'circ' - the category statistics are recomputed without the stimulus, exactly: its own category's mean and covariance by a rank-one downdate, and with `ctgPoolWidth` (and `bPoolMeans`) or `covTarget='pooled'` shrinkage every category's pooled covariance (and mean), which the stimulus also enters. Needs at least 3 stimuli per category (2 with `ctgPoolWidth` or `circMean='zero'`), also in every batch (`Optimizer nBatchMinCtg`).
+
+The stimulus is also left out of its category's prior, `(N_k-1)/(N-1)`, and of its category's noise covariance (the mean noise variance). Full AMA's form already has the left-out prior. Not available with `errType='mle'`. Held-out evaluation (`unit.evaluate`, `cross_validate`) is unaffected.
 
 ### Objective
 ```python
@@ -200,7 +222,10 @@ objective=ama.Objective(errType='map',   # error
                         estType=None,    # estimator for 'l1' and 'l2'
                         lossType='mean', # how errors are combined
                         regType='None',  # filter penalty while training
-                        regWeight=0.)    # its weight
+                        regWeight=0.,    # its weight
+                        targetSigma=None,# target for the divergence errTypes
+                        otEps=0.05,      # 'wasserstein', several latent dimensions, gaussian target: sinkhorn regularization
+                        nOtIter=200)     # and iterations
 ```
 
 errType
@@ -209,7 +234,20 @@ errType
 - 'l2' (or 2) - squared error of the estimate; estType defaults to 'mean' (MMSE)
 - 'l1' (or 1) - absolute error of the estimate; estType defaults to 'median'
 
-estType - 'mean', 'median', 'mode' (MAP; no gradient), or 'cmean' (circular mean, Y in radians)
+Divergences between the posterior over the levels and a target distribution around the correct level:
+- 'xent' - cross-entropy; the same as 'map' with the one-hot target
+- 'js' - Jensen-Shannon divergence (natural log, at most log 2)
+- 'wasserstein' - 1-Wasserstein (earth mover's) distance over `Y`; with the one-hot target, the posterior mean of `|Y - X_k|`
+- 'fisher' - Fisher divergence: the target-weighted squared difference of the scores `d log p / dY`, taken as finite differences between neighbouring levels. It doesn't depend on the posterior's normalization, and needs `targetSigma`
+
+targetSigma - `None` for a one-hot target, or the standard deviation, in units of `Y`, of a gaussian target `q_i ~ exp(-(Y_i - X_k)^2 / 2 targetSigma^2)`. On circular dimensions (`Stim Yperiod`) the target is a wrapped gaussian (nearest image). 'wasserstein' and 'fisher' use the distances between levels, so their scale follows `Y`.
+
+With several latent dimensions (euclidean distance between levels, wrapped on circular dimensions):
+- 'wasserstein' with the one-hot target is exact (the posterior mean distance to the correct level). With a gaussian target it is the debiased entropic (Sinkhorn) divergence `OT(p,q) - OT(p,p)/2 - OT(q,q)/2`, zero at the target, with regularization `otEps` times the mean distance between levels and `nOtIter` iterations: a smaller `otEps` approaches the exact distance but needs more iterations. Its gradient comes from the Sinkhorn potentials (no backpropagation through the iterations).
+- 'fisher' needs the levels on a cartesian grid (every combination of the per-dimension values): scores are finite differences along each grid axis, and the divergence sums the per-axis terms.
+- Circular dimensions must span less than their period.
+
+estType - 'mean' (circular on circular dimensions), 'median' (per dimension; on circular dimensions the circular median), 'mode' (MAP; no gradient), or 'cmean' (circular mean, Y in radians; superseded by `Stim Yperiod` with 'mean')
 
 lossType - 'mean' or 'median' over the valid stimuli
 
@@ -229,10 +267,12 @@ optimizer=ama.Optimizer(optimizerType='adam',            # optax algorithm
                         nStepsPerChunk=100,              # iterations compiled together
                         bVerbose=True,                   # print the loss after each chunk
                         nBatchMinCtg=2,                  # minimum stimuli per category in a batch
-                        patience=None)                   # early stopping (with stimVal)
+                        patience=None,                   # early stopping (with stimVal)
+                        stepMin=0.,                      # 'ama_sgd': smallest step
+                        stepDecay=0.01)                  # 'ama_sgd': fraction the step shrinks each iteration
 ```
 
-optimizerType - any optimizer in the [optax documentation](https://optax.readthedocs.io/en/latest/api/optimizers.html).
+optimizerType - any optimizer in the [optax documentation](https://optax.readthedocs.io/en/latest/api/optimizers.html), or `'ama_sgd'`: the update of Burge & Jaini (2017) and [burgelab/AMA](https://github.com/burgelab/AMA) (`gradSGD.m`, `updateSGD.m`). Each filter moves a distance `lRate0*(1-stepDecay)^t` (at least `stepMin`) along its unit-normalized tangent-plane gradient and is renormalized, and a step is kept only if it does not raise the cost of the batch it was computed on (evaluated again with the same noise, one extra forward pass per iteration). With `batchSize` this is AMA-SGD; without it, the full-batch cost never increases. It needs `projectionType=['l2_sphere',1]` and applies to `train_new`/`train_append`/`train_recurse` (not the generated filters of `train_parametric`/`train_multiscale`). Unlike burgelab/AMA, which walks each permutation of the training set in consecutive batches, every iteration draws a new batch stratified by category.
 
 projectionType - any optax [projection](https://optax.readthedocs.io/en/latest/api/projections.html), applied to each filter.
 Constrained optimization is a requirement: otherwise filter magnitude grows without bound.
@@ -261,7 +301,7 @@ unit=ama.Unit(stim,nrn,model,objective,optimizer=None,seed=None,name=None)
 ```python
 unit.train_new(n,fourierType=None,bSplit=None,stimInd=None,dtype=None,optimizer=None,nRestarts=1)
 ```
-Discard current filters (if any) and learn `n` new filters. With `nRestarts=k`, learn from `k` random initial filter sets and keep the one with the lowest cost (costs in `unit.restart_costs`).
+Discard current filters (if any) and learn `n` new filters. With `nRestarts=k`, learn from `k` random initial filter sets and keep the one with the lowest cost: on the validation stimuli when `stimVal` is given, else on the training stimuli (costs in `unit.restart_costs`).
 
 ```python
 unit.train_append(n,...,nRestarts=1)
@@ -407,18 +447,41 @@ See the tests in `tests/` for reference implementations of the math.
 - normalization indices
 - phase parameter for quadrature pair learning
 - fmincon-like options
-- installable Filter dependency; move to src
+- move to src
 - jupyter notebooks with different data
 - better rmax and eps defaults?
 - merge Objective and Model?
 
+Known limitations
+- likelihoods: 'mix' has no pooling or shrinkage; its leave-one-out holds the responsibilities fixed, and an EM
+  component that empties stays empty (also across warm-started iterations)
+- noise: the default mean-response approximation is optimistic at high noise (responseType='basic' samples the noise
+  instead); stage-1 noise is carried through 'gen' normalization only to first order; noise correlations are specified (rho), with
+  stimulus-dependent variances but a fixed correlation structure
+- scaling: without covRank, AMA-Gauss needs more stimuli per category than response dimensions
+- encoder: linear unit-norm filters with a fixed nonlinearity; `train_append` is greedy and the objective is nonconvex
+  (restarts help); no learned nonlinearity or hierarchy (see 'layers')
+- latent variables: 'fisher' with several dimensions needs a grid of levels; the entropic 'wasserstein' (several
+  dimensions, gaussian target) is approximate (otEps); the circular target is a nearest-image wrapped gaussian (fine for targetSigma well below
+  the period); latent values are still a discrete set of levels (estimates between levels only through 'mean'/'median')
+- engineering: ama.py is a single ~4000 line module; optax is pinned to a git commit in setup.py
+
 V2
 - learn normalization indices?
 - weights and combination learning beyond the pooled resultant (readoutType)
-- specified noise covariance
 - low-rank (signal plus noise) category covariances for 'circ'
 - layers
 
+
+Possible optimizations
+- bLeaveOneOut ('gss', 'student', 'circ', 'mix'): one Cholesky per stimulus of its left-out covariance. The left-out
+  category covariance is a rank-one downdate, but the left-out noise covariance rescales its diagonal per stimulus, so
+  the matrix determinant lemma and Sherman-Morrison apply only with independent noise of equal variances (or with the
+  noise term kept fixed); then each left-out log-likelihood would take O(nF^2) instead of O(nF^3). The full lAll is
+  also computed before its diagonal is replaced. With covRank, leave-one-out runs the factor analysis EM per stimulus. With pooling (or the pooled shrinkage
+  target) every category's covariance differs per stimulus: one Cholesky per stimulus and category, and tensors of
+  [ nStim x nCtg x nF x nF ] per category (O(nCtg^2 nF^2) work per stimulus); a low-rank update of the shared pooled
+  statistics would avoid materializing them.
 
 # Works cited
 (1) Burge J, Jaini P (2017). Accuracy Maximization Analysis for sensory-perceptual tasks: Computational improvements, filter robustness, and coding advantages for scaled additive noise.  PLoS Computational Biology, 13(2): e1005281. doi:10.1371/journal.pcbi.1005281

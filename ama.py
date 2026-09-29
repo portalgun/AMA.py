@@ -249,9 +249,88 @@ def _flatten_responses(X):
 def _centered_freqs(n):
     return np.fft.fftshift(np.fft.fftfreq(n))
 
+_FULL_CHUNK=2**24                            # full AMA: elements of the [ observed x reference x category ] terms per chunk
+_SQRT2=float(np.sqrt(2))                     # a python float keeps the precision of the array it scales
+
 def _safe_divide(num,den):
     # zero denominators (e.g. the all-zero padding stimuli) give 0 rather than nan, with finite gradients
     return num/jnp.where(den!=0,den,1)
+
+#- latent geometry: Y [ nCtg ] or [ nCtg x nDim ]; per (Stim.Yperiod) is None or one period (None = linear) per dimension
+def _period_arrays(per,dtype=float):
+    # periods and circular mask over the latent dimensions (period 1 on linear dimensions)
+    P=np.array([0. if q is None else float(q) for q in per])
+    return jnp.asarray(np.where(P>0,P,1.),dtype=dtype),jnp.asarray(P>0)
+
+def _wrap(d,per):
+    """differences of latent values d [ ... ] (1-D Y) or [ ... x nDim ], wrapped into [-P/2, P/2) on circular dimensions"""
+    if per is None:
+        return d
+    P,bC=_period_arrays(per,d.dtype)
+    if len(per)==1:
+        P,bC=P[0],bC[0]
+    return jnp.where(bC,d-P*jnp.floor(d/P+0.5),d)
+
+class _ErrOpts(tuple):
+    """static options of the error functions: the latent grid (Stim levels on a cartesian grid), whether the target is
+    one-hot, and the entropic optimal transport settings"""
+    def __new__(cls,grid=None,bOneHot=True,otEps=0.05,nOtIter=200):
+        return super().__new__(cls,(grid,bOneHot,otEps,nOtIter))
+    grid=property(lambda self: self[0])
+    bOneHot=property(lambda self: self[1])
+    otEps=property(lambda self: self[2])
+    nOtIter=property(lambda self: self[3])
+
+def _latent_grid(Y):
+    """
+    for Y [ nCtg x nDim ] whose levels are all combinations of per-dimension values: (grid shape, order) with order the
+    categories in C order over the ascending values of each dimension; else None
+    """
+    Y=np.asarray(Y)
+    if Y.ndim!=2:
+        return None
+    vals=[np.unique(Y[:,d]) for d in range(Y.shape[1])]
+    shape=tuple(len(v) for v in vals)
+    if int(np.prod(shape))!=len(Y):
+        return None
+    pos=np.stack([np.searchsorted(v,Y[:,d]) for d,v in enumerate(vals)],1)
+    flat=np.ravel_multi_index(pos.T,shape)
+    if len(np.unique(flat))!=len(Y):
+        return None
+    order=np.empty(len(Y),dtype=int)
+    order[flat]=np.arange(len(Y))
+    return shape,tuple(int(i) for i in order)
+
+def _sinkhorn_value(la,lb,C,eps,nIter):
+    """
+    entropic optimal transport value OT_eps(a,b) between log-weights la [ ... x n ] and lb [ ... x m ] (broadcast) with cost
+    C [ n x m ]: the dual value sum a f + sum b g at the Sinkhorn potentials. The potentials are not differentiated
+    (envelope theorem: the gradient of the value in a is f), so no iteration is stored for the backward pass
+    """
+    la_,lb_=lax.stop_gradient(la),lax.stop_gradient(lb)
+    shape=jnp.broadcast_shapes(la_.shape[:-1],lb_.shape[:-1])
+    f=jnp.zeros(shape+(C.shape[0],),dtype=C.dtype)
+    g=jnp.zeros(shape+(C.shape[1],),dtype=C.dtype)
+    def body(_,fg):
+        f,g=fg
+        f=-eps*logsumexp((g[...,None,:]-C)/eps + lb_[...,None,:],axis=-1)
+        g=-eps*logsumexp((f[...,:,None]-C)/eps + la_[...,:,None],axis=-2)
+        return f,g
+    f,g=lax.fori_loop(0,nIter,body,(f,g))
+    f,g=lax.stop_gradient(f),lax.stop_gradient(g)
+    return jnp.sum(jnp.exp(la)*f,axis=-1)+jnp.sum(jnp.exp(lb)*g,axis=-1)
+
+def _take_stim(A,idx):
+    # rows idx [ m x nCtg ] of A [ nStim_Ctg x nCtg (x nDim) ] within each category
+    return jnp.take_along_axis(A,idx.reshape(idx.shape+(1,)*(A.ndim-2)),axis=0)
+
+def _ysq(d,Y):
+    # squared distance of (wrapped) differences, summed over latent dimensions
+    return d**2 if Y.ndim==1 else jnp.sum(d**2,axis=-1)
+
+def _ydist2(Y,per):
+    """[ nCtg x nCtg ] squared (wrapped) distances between latent values"""
+    return _ysq(_wrap(Y[None,:]-Y[:,None],per),Y)
 
 def _inv_sqrtm(M,nIter=40):
     """
@@ -310,6 +389,56 @@ class _BoundLoss:
 
     def __eq__(self,other):
         return isinstance(other,_BoundLoss) and self.name==other.name and self.owner==other.owner
+
+def _freeze(v):
+    """a hashable version of a (nested) configuration value: dicts, sequences, arrays, scalars"""
+    if isinstance(v,dict):
+        return ('dict',tuple(sorted((str(k),_freeze(x)) for k,x in v.items())))
+    if isinstance(v,(list,tuple)):
+        return ('seq',tuple(_freeze(x) for x in v))
+    if isinstance(v,(np.ndarray,jnp.ndarray)):
+        a=np.asarray(v)
+        return ('arr',a.dtype.str,a.shape,a.tobytes())
+    if isinstance(v,np.generic):
+        return v.item()
+    return v
+
+class _GeneratedLoss:
+    """
+    the cost of filters generated from parameters (Unit.train_parametric, train_multiscale), for use as a static jit
+    argument: hashed by the unit's settings, the generator (kind and its configuration), and the learned frequencies
+    the generator reads from the unit, so repeated training with the same configuration reuses the compiled steps
+    """
+    def __init__(self,unit,kind,cfg):
+        self.unit=unit
+        self.kind=kind
+        self.cfg=cfg
+        flt=unit.filter
+        self._k=(kind,_freeze(cfg),tuple(flt.pix_dims),np.asarray(flt.index.pix).tobytes())
+
+    def full(self,prm):
+        out={'f':self.unit._generated_filters(self.kind,prm,self.cfg)}
+        if 'p' in prm:
+            out['p']=prm['p']
+        return out
+
+    def __call__(self,prm,rng_key,stimval,stimweights,yCtg,Y):
+        cost=self.unit._loss_fun(self.full(prm),rng_key,stimval,stimweights,yCtg,Y,None)
+        pen=self.unit._generated_penalty(self.kind,prm,self.cfg)
+        return cost if pen is None else cost+pen
+
+    def heldout(self,prm,rng_key,stimval,stimweights,yCtg,Y,refval,refweights):
+        return self.unit._loss_fun_heldout(self.full(prm),rng_key,stimval,stimweights,yCtg,Y,refval,refweights)
+
+    def __hash__(self):
+        return hash((self.unit,self._k))
+
+    def __eq__(self,other):
+        return isinstance(other,_GeneratedLoss) and self._k==other._k and self.unit==other.unit
+
+@partial(jit, static_argnames=['loss'])
+def _generated_heldout(loss,prm,rng_key,stimval,stimweights,yCtg,Y,refval,refweights):
+    return loss.heldout(prm,rng_key,stimval,stimweights,yCtg,Y,refval,refweights)
 
 class _ParentProp:
     def __init__(self, pname=None,default=None):
@@ -443,17 +572,22 @@ class Stim:
         out=copy.copy(self)
         out.val=self.val[...,stimInd,:]
         out.weights=self.weights[stimInd,:]
-        out.yCtg=self.yCtg[stimInd,:]
+        out.yCtg=self.yCtg[stimInd]
         out.yCtgInd=self.yCtgInd[stimInd,:]
         out.nStim_Ctg=len(stimInd)
         out.nStim=out.nStim_Ctg*out.nCtg
         return out
 
-    def __init__(self,x,stimuli,yCtgInd,Y,bStimIsFourier=False,nSplit=0,bStimIsSplit=False,bContrastNormalize=False):
+    def __init__(self,x,stimuli,yCtgInd,Y,bStimIsFourier=False,nSplit=0,bStimIsSplit=False,bContrastNormalize=False,
+                 Yperiod=None):
         """
         stimuli [ *dims x nStim ], contrast normalized (zero mean, unit norm; a warning is given otherwise)
         yCtgInd [ nStim ] category label of each stimulus (any integer coding, e.g. 1-based from matlab)
-        Y       [ nCtg ]  latent variable value of each category, in sorted label order
+        Y       [ nCtg ] or [ nCtg x nDim ] latent value(s) of each category, in sorted label order. Several latent
+                dimensions (e.g. disparity and speed) are estimated jointly; the categories are their combinations
+        Yperiod - None (linear), or the period of circular latent variables (e.g. 180 for orientation in degrees, 2*pi
+                  for phase): one value for every dimension, or one per dimension with None for the linear ones.
+                  Distances between latent values (errors, estimates, targets, category pooling) wrap around it
         bContrastNormalize - contrast normalize the stimuli (spatial domain only)
         """
 
@@ -467,9 +601,18 @@ class Stim:
         self.ctg,yCtgInd=np.unique(yCtgInd,return_inverse=True) # relabel to 0..nCtg-1
         self.nCtg=len(self.ctg)
 
-        self.Y=jnp.asarray(np.asarray(Y,dtype=float).ravel()) # unique
-        if len(self.Y)!=self.nCtg:
-            raise Exception('Y has ' + str(len(self.Y)) + ' values but there are ' + str(self.nCtg) + ' categories')
+        Y=np.asarray(Y,dtype=float)
+        if Y.ndim==2 and 1 in Y.shape:
+            Y=Y.ravel()                                                    # a row or column vector (e.g. from matlab)
+        if Y.ndim not in (1,2):
+            raise Exception('Y must be [ nCtg ] or [ nCtg x nDim ]')
+        if len(Y)!=self.nCtg:
+            raise Exception('Y has ' + str(len(Y)) + ' values but there are ' + str(self.nCtg) + ' categories')
+        if len(np.unique(Y,axis=0))!=self.nCtg:
+            raise Exception('categories must have distinct latent values Y')
+        self.Y=jnp.asarray(Y)
+        self.nDim=1 if Y.ndim==1 else Y.shape[1]
+        self.Yperiod=Stim._parse_period(Yperiod,self.nDim)
         if stimuli.shape[-1]!=len(yCtgInd):
             raise Exception('last dimension of stimuli must equal the number of labels')
 
@@ -490,11 +633,11 @@ class Stim:
             _warn_if_not_contrast_normalized(stimuli)
         val=np.zeros((self.nPix,self.nStim_Ctg,self.nCtg),dtype=stimuli.dtype)
         weights=np.zeros((self.nStim_Ctg,self.nCtg))
-        yctg=np.zeros((self.nStim_Ctg,self.nCtg))
+        yctg=np.zeros((self.nStim_Ctg,self.nCtg)+Y.shape[1:])
         for c in range(self.nCtg):
             val[:,:nStimCtg[c],c]=stimuli[:,yCtgInd==c]
             weights[:nStimCtg[c],c]=1
-            yctg[:,c]=self.Y[c]
+            yctg[:,c]=Y[c]
 
         self.val=jnp.array(val)
         self.weights=jnp.array(weights)
@@ -505,6 +648,19 @@ class Stim:
         if self.bIsSplit:
             self.bIsSplit=False
             self.split()
+
+    @staticmethod
+    def _parse_period(Yperiod,nDim):
+        # None, or a tuple of one period (float) or None per latent dimension
+        if Yperiod is None:
+            return None
+        per=list(Yperiod) if isinstance(Yperiod,(list,tuple,np.ndarray)) else [Yperiod]*nDim
+        if len(per)!=nDim:
+            raise Exception('Yperiod needs one value per latent dimension (' + str(nDim) + ')')
+        per=tuple(None if q is None else float(q) for q in per)
+        if any(q is not None and not q>0 for q in per):
+            raise Exception('periods in Yperiod must be positive (or None for linear dimensions)')
+        return None if all(q is None for q in per) else per
 
     #- held-out data
     def _valid_indices(self):
@@ -524,7 +680,7 @@ class Stim:
         wj=jnp.asarray(w,dtype=jnp.asarray(self.weights).dtype)
         out.val=jnp.take_along_axis(self.val,jnp.broadcast_to(idx,self.val.shape[:-2]+idx.shape),axis=-2)*wj.astype(self.val.dtype)
         out.weights=wj
-        out.yCtg=jnp.take_along_axis(jnp.asarray(self.yCtg),idx,axis=0)
+        out.yCtg=_take_stim(jnp.asarray(self.yCtg),idx)
         out.yCtgInd=jnp.take_along_axis(jnp.asarray(self.yCtgInd),idx,axis=0)
         out.nStim_Ctg=mMax
         out.nStim=mMax*self.nCtg
@@ -916,7 +1072,10 @@ class Nrn(_Static):
                                      'narrow' and to first order for 'gen' (which underestimates, by ~5-10% when noise is
                                      ~10% of the pooled response); with both stages on, the variances add, with
                                      stage 2's scaled by the expected |response| given stage-1 noise
-    rho correlates the noise of all response dimensions (filters, sub-filters, real/imaginary components) equally.
+    rho correlates the noise of the response dimensions: a number correlates all of them (filters, sub-filters,
+    real/imaginary components) equally; a correlation matrix [ nDim x nDim ] specifies each pair, over the flattened
+    response dimensions in the order of _flatten_responses (real parts of all filters, sub-filters within each filter,
+    then the imaginary parts), in noise sampling and in the likelihood alike. None: no noise.
     """
     _noise_1_fun=_id
     _noise_2_fun=_id
@@ -955,10 +1114,11 @@ class Nrn(_Static):
                        'resultant_only' - only the weighted resultant (weighted phase congruency with 'phase')
         """
         # rmax=5.7, var0=0.23 as in burgelab/AMA (paramRSP of AMAdataDisparity.mat)
-        self.fano=fano
-        self.var0=var0
-        self.rmax=rmax
-        self.eps=eps
+        # python floats: numpy scalars (e.g. read from a .mat file) would promote float32 learning to float64 under jax x64
+        self.fano=float(fano)
+        self.var0=float(var0)
+        self.rmax=float(rmax)
+        self.eps=float(eps)
 
         self.bNoise_1=bNoise_1
         self.bNoise_2=bNoise_2
@@ -972,12 +1132,6 @@ class Nrn(_Static):
         self.readoutType=readoutType
 
         self.rho=rho
-        if self.rho is None or ( isinstance(self.rho,str) and self.rho == 'None' ):
-            self.corrType='None'
-        elif self.rho==0:
-            self.corrType='uncorr'
-        else:
-            self.corrType='corr'
 
         self.filter=Filter()
         self.bFinalized=False
@@ -990,7 +1144,7 @@ class Nrn(_Static):
             return None
 
     def _key(self):
-        return (self.fano,self.var0,self.rmax,self.eps,self.nSamples,self.rho,
+        return (self.fano,self.var0,self.rmax,self.eps,self.nSamples,_freeze(self.rho),
                 self.bNoise_1,self.bNoise_2,self.activationType,self.normalizeType,self.corrType,self.averageType,
                 self.whitenType,self.whitenMethod,self.whitenEps,self.readoutType,getattr(self.filter,'pix_dims',None),
                 getattr(self,'bFourier',None),getattr(self,'bSplit',None),self.bAnalytic,str(getattr(self,'dtype',None)))
@@ -1063,9 +1217,31 @@ class Nrn(_Static):
         # noisey output 2
         RNs = self._average_fun(self._noise_2_fun(RN,self.fano,self.var0,self.nSamples,rng_key2,self.rho))
 
-        return r,rNs,R,RNs,self._likelihood_variance(r,R)
+        return r,rNs,R,RNs,self._likelihood_variance(r,R,f,stim)
 
-    def _likelihood_variance(self,r,R):
+    @property
+    def rho(self):
+        return self._rho
+
+    @rho.setter
+    def rho(self,rho):
+        # the noise correlation type follows rho, also when rho is changed after construction
+        if rho is not None and not isinstance(rho,str) and np.ndim(rho)>0:
+            rho=np.array(rho,dtype=float)                                        # a correlation matrix
+            if rho.ndim!=2 or rho.shape[0]!=rho.shape[1]:
+                raise Exception('rho must be a number or a square correlation matrix')
+            self._rho=rho
+            self.corrType='corr'
+            return
+        self._rho=rho
+        if rho is None or (isinstance(rho,str) and rho=='None'):
+            self.corrType='None'
+        elif rho==0:
+            self.corrType='uncorr'
+        else:
+            self.corrType='corr'
+
+    def _likelihood_variance(self,r,R,f,stim):
         # see the class docstring. r: responses before normalization, R: after
         if not self.bNoise_1:
             return self.variance(R,self.fano,self.var0)
@@ -1078,10 +1254,10 @@ class Nrn(_Static):
             V=jnp.sum(v1,axis=axes,keepdims=True)
             var=v1/D**2 - 2*jnp.abs(r)*v1/D**3 + r**2*V/D**4
         else:
-            # linear normalizations scale each response by |R|/|r| (padding, where r = 0, keeps gain 1)
-            r2=jnp.real(r*jnp.conj(r))
-            R2=jnp.real(R*jnp.conj(R))
-            var=v1*jnp.where(r2>0,R2/jnp.where(r2>0,r2,1),1)
+            # linear normalizations ('broad', 'narrow') divide each response by a stimulus-dependent denominator: its gain
+            # is the normalization of ones (also where an activation made the response exactly 0)
+            g=self._normalize_fun(jnp.ones(r.shape,dtype=jnp.real(r).dtype),f,stim,self.eps,self.bSplit)
+            var=v1*g**2
         if self.bNoise_2:
             # stage-2 noise is scaled by the noisy stage-1 response: E[fano*|RN| + var0], RN ~ N(R, var) per component
             var=var+self._expected_variance(R,var)
@@ -1223,7 +1399,7 @@ class Nrn(_Static):
 
     #- filters and responses
     def _scale(self,f):
-        return f*np.sqrt(2) if self.bFourier else f
+        return f*_SQRT2 if self.bFourier else f
 
     def _respond(self,f,stim):
         # f scaled by _scale
@@ -1325,9 +1501,9 @@ class Nrn(_Static):
         bComplex=jnp.iscomplexobj(R)
         Rr=jnp.concatenate((R.real,R.imag),axis=0) if bComplex else R          # [ nDim x ... ]
         z=jxrandom.normal(rng_key,Rr.shape+(nSamples,),dtype=Rr.dtype)
-        if rho is not None and rho!=0:
+        if rho is not None and (np.ndim(rho)>0 or rho!=0):
             zf=jnp.reshape(z,(-1,)+z.shape[-3:])                                 # [ nDim' x nStim_Ctg x nCtg x nSamples ]
-            L=jnp.linalg.cholesky(rho + (1-rho)*jnp.eye(zf.shape[0],dtype=zf.dtype))
+            L=jnp.linalg.cholesky(Nrn._corr_mat(rho,zf.shape[0],zf.dtype))
             z=jnp.reshape(jnp.einsum('fg,g...->f...',L,zf),z.shape)
         eta=z*jnp.sqrt(fano*jnp.abs(Rr)+var0)[...,None]
         if bComplex:
@@ -1360,7 +1536,14 @@ class Nrn(_Static):
 
     def corr_matrix(self,n,dtype=float):
         # noise correlation between the n flattened response dimensions
-        return self.rho + (1-self.rho)*jnp.eye(n,dtype=dtype)
+        return Nrn._corr_mat(self.rho,n,dtype)
+
+    @staticmethod
+    def _corr_mat(rho,n,dtype=float):
+        # rho: one correlation for all pairs, or the correlation matrix itself
+        if np.ndim(rho)>0:
+            return jnp.asarray(rho,dtype=dtype)
+        return rho + (1-rho)*jnp.eye(n,dtype=dtype)
 
     #- noise covariance, per category, of the flattened (real) responses
     #  RVar [ nF x nStim_Ctg x nCtg ], weights [ nStim_Ctg x nCtg ] -> [ nCtg x nF x nF ]
@@ -1380,8 +1563,7 @@ class Nrn(_Static):
     @staticmethod
     def _corr__corr(RVar,weights,rho):
         sd=jnp.sqrt(Nrn._mean_var(RVar,weights).T)                   # [ nCtg x nF ]
-        n=RVar.shape[0]
-        corrMat=rho + (1-rho)*jnp.eye(n,dtype=RVar.dtype)
+        corrMat=Nrn._corr_mat(rho,RVar.shape[0],RVar.dtype)
         return sd[:,:,None]*sd[:,None,:]*corrMat[None]
 
 
@@ -1402,6 +1584,31 @@ class Model(_Static):
            whose complex gain (contrast and phase) is unknown, R = G m_i + noise with a circularly symmetric G.
     The prior p(X_i)=N_i/N is applied by Objective, so the posterior equals Eq 5 exactly.
 
+    'mix'  a gaussian mixture per category: p(R|X_i) = sum_c pi_ic N(R; mu_ic, Sigma_ic + Lambda_i), fit to the category's
+           mean responses by nEM EM iterations, initialized by quantiles of the responses along the category's first
+           principal axis (a piecewise constant assignment). The EM iterations are differentiated, so gradients include
+           how the fit moves with the filters. The fitted component covariances are Bessel corrected, so nMix=1 with
+           mixReg=0 is 'gss'.
+           nMix   - components per category
+           nEM    - EM iterations
+           bWarmEM, nEMWarm - while training, start EM from the previous iteration's fit and run nEMWarm iterations
+                    (unit.loss and evaluate fit from scratch with nEM)
+           bLeaveOneOut - the stimulus's responsibility-weighted contribution is removed from its own category's
+                    components, with the responsibilities of the full fit held fixed
+           mixReg - ridge added to each component covariance, relative to the category's mean response variance
+                    (keeps components from collapsing onto few stimuli)
+
+    nRef ('full' only) - while training, decode each stimulus against nRef reference stimuli per category, drawn at
+                   random each iteration, instead of all of them: O(N nRef) instead of O(N^2) per iteration. The cost
+                   is then a stochastic (slightly pessimistic: log of a sample mean) estimate of full AMA's; unit.loss,
+                   evaluate and performance decode against all training stimuli.
+
+    covRank ('gss', 'student', 'mix') - model each category (or mixture component) covariance as factor analysis,
+                   L L^T + Psi with covRank factors L and a diagonal Psi, fit to the sample covariance by nFA EM
+                   iterations (differentiated; initialized from its leading subspace). Needs far fewer stimuli per
+                   category than a full covariance when there are many response dimensions. Applied before covShrink,
+                   and to the left-out covariances of bLeaveOneOut. covRank=0 is a diagonal covariance.
+
     Category statistics ('gss', 'student', 'circ'):
     covShrink     - shrink each category covariance toward covTarget by this fraction (0 = sample covariance):
                     Sigma = (1-covShrink) Sigma + covShrink T, before the noise covariance is added
@@ -1412,17 +1619,25 @@ class Model(_Static):
                     which stabilizes covariances of small categories whose statistics change smoothly with Y
     bPoolMeans    - also pool the category means with the same kernel (biases the means toward neighbours)
 
-    bLeaveOneOut ('full' only) - leave the decoded stimulus out of its own category, so the posterior is Eq 5 with that
-                   stimulus removed from the training set. Otherwise each stimulus matches its own mean response, which
-                   makes the cost optimistic when noise is low or categories (or batches) are small.
+    bLeaveOneOut - leave the decoded stimulus out of its own category. Otherwise each stimulus is scored against statistics
+                   that include it, which makes the cost optimistic when noise is low, filters are many, or categories
+                   (or batches) are small.
+                   'full': the posterior is Eq 5 with that stimulus removed from the training set.
+                   'gss', 'student', 'circ': the category statistics are recomputed without it, exactly: a rank-one
+                   downdate of its own category's mean and covariance, and with ctgPoolWidth (bPoolMeans) or the pooled
+                   shrinkage target also of every category's pooled covariance (and mean), which it enters too.
+                   The stimulus is also left out of its category's prior, (N_k-1)/(N-1), and noise covariance (the mean
+                   noise variance); full AMA's form already has the left-out prior (see _model__full).
     """
     _model_fun=_id
     _response_fun=_id
+    _Yperiod=None                                                               # from the Stim, set by Unit._finalize
     modelType=_TypeFunc()
     responseType=_TypeFunc()
 
     def __init__(self,modelType='gss',responseType='basic',bLeaveOneOut=False,covShrink=0.,covTarget='diag',df=5.,
-                 ctgPoolWidth=None,bPoolMeans=False,circMean='estimate'):
+                 ctgPoolWidth=None,bPoolMeans=False,circMean='estimate',nMix=2,nEM=20,mixReg=1e-3,nRef=None,covRank=None,nFA=50,
+                 bWarmEM=False,nEMWarm=3):
         self.modelType=modelType
         self.responseType=responseType
         self.bLeaveOneOut=bLeaveOneOut
@@ -1432,6 +1647,20 @@ class Model(_Static):
         self.ctgPoolWidth=None if ctgPoolWidth is None else float(ctgPoolWidth)
         self.bPoolMeans=bool(bPoolMeans)
         self.circMean=circMean
+        self.nMix=int(nMix)
+        self.nEM=int(nEM)
+        self.mixReg=float(mixReg)
+        self.nRef=None if nRef is None else int(nRef)
+        self.bWarmEM=bool(bWarmEM)
+        self.nEMWarm=int(nEMWarm)
+        self.covRank=None if covRank is None else int(covRank)
+        self.nFA=int(nFA)
+        if (self.covRank is not None and self.covRank<0) or self.nFA<1:
+            raise Exception('covRank must be None or not negative, and nFA at least 1')
+        if self.nRef is not None and self.nRef<1:
+            raise Exception('nRef must be None or at least 1')
+        if self.nMix<1 or self.nEM<0 or self.mixReg<0:
+            raise Exception('nMix must be at least 1, nEM and mixReg not negative')
         if not 0<=self.covShrink<=1:
             raise Exception('covShrink must be in [0, 1]')
         if covTarget not in ('diag','pooled'):
@@ -1443,21 +1672,29 @@ class Model(_Static):
 
     def _key(self):
         return (self.modelType,self.responseType,self.bLeaveOneOut,self.covShrink,self.covTarget,self.df,
-                self.ctgPoolWidth,self.bPoolMeans,self.circMean)
+                self.ctgPoolWidth,self.bPoolMeans,self.circMean,self._Yperiod,self.nMix,self.nEM,self.mixReg,self.nRef,
+                self.covRank,self.nFA,self.bWarmEM,self.nEMWarm)
 
     def copy(self):
        return Model(**_get_copy_dict(self))
 
     #-main
     @partial(jit, static_argnames=['self'])
-    def lrn_main(self,R,Rm,RVar,noiseCov,noiseCorr,weights,Y):
-        return self._model_fun(R,Rm,RVar,noiseCov,noiseCorr,weights,self.bLeaveOneOut,self,Y)
+    def lrn_main(self,R,Rm,RVar,noiseCov,noiseCorr,weights,Y,refIdx=None):
+        return self._model_fun(R,Rm,RVar,noiseCov,noiseCorr,weights,self.bLeaveOneOut,self,Y,refIdx)
+
+    @staticmethod
+    def _ref_subset(rng,weights,nRef):
+        # nRef random valid reference stimuli per category [ nRef x nCtg ] (fewer valid ones: padding, weight 0, fills up)
+        nRef=min(nRef,weights.shape[0])
+        score=jxrandom.uniform(rng,weights.shape) + jnp.where(weights>0,0.,jnp.inf)
+        return jnp.argsort(score,axis=0)[:nRef]
 
     #- category statistics
     @staticmethod
-    def _ctg_kernel(Y,width):
-        # [ nCtg x nCtg ] gaussian weights over latent values
-        return jnp.exp(-(Y[:,None]-Y[None,:])**2/(2*width**2))
+    def _ctg_kernel(Y,width,per=None):
+        # [ nCtg x nCtg ] gaussian weights over (wrapped) distances between latent values
+        return jnp.exp(-_ydist2(Y,per)/(2*width**2))
 
     @staticmethod
     def _ctg_stats(Rm,weights,m,Y,bCentered=True):
@@ -1468,16 +1705,17 @@ class Model(_Static):
         wc=jnp.sum(weights,axis=0)                                               # [ nCtg ]
         mu=jnp.sum(Rm*weights,axis=1)/wc                                         # [ nF x nCtg ]
         if m.ctgPoolWidth is not None and m.bPoolMeans:
-            K=Model._ctg_kernel(Y,m.ctgPoolWidth)*wc[None,:]
+            K=Model._ctg_kernel(Y,m.ctgPoolWidth,m._Yperiod)*wc[None,:]
             mu=jnp.einsum('ik,fk->fi',K,mu)/jnp.sum(K,axis=1)[None,:]
         Dv=(Rm-mu[:,None,:])*jnp.sqrt(weights) if bCentered else Rm*jnp.sqrt(weights)
         S=jnp.einsum('isc,jsc->cij',Dv,jnp.conj(Dv))                             # [ nCtg x nF x nF ] scatter
         dof=(wc-1) if bCentered else wc
         if m.ctgPoolWidth is not None:
-            K=Model._ctg_kernel(Y,m.ctgPoolWidth)
+            K=Model._ctg_kernel(Y,m.ctgPoolWidth,m._Yperiod)
             cov=jnp.einsum('ik,kfg->ifg',K,S)/(K@dof)[:,None,None]
         else:
             cov=S/dof[:,None,None]
+        cov=Model._low_rank(cov,m)
         if m.covShrink>0:
             if m.covTarget=='pooled':
                 T=jnp.broadcast_to(jnp.sum(S,axis=0)/jnp.sum(dof),cov.shape)
@@ -1485,6 +1723,170 @@ class Model(_Static):
                 T=cov*jnp.eye(cov.shape[-1],dtype=cov.dtype)
             cov=(1-m.covShrink)*cov + m.covShrink*T
         return mu,cov
+
+    @staticmethod
+    def _low_rank(S,m):
+        """
+        factor analysis covariance L L^T + Psi (covRank factors) of sample covariances S [ ... x p x p ], by the EM of
+        Ghahramani & Hinton (1996) on S: beta = L^T Sigma^-1, Ezz = I - beta L + beta S beta^T, L = S beta^T Ezz^-1,
+        Psi = diag(S - L beta S). Initialized from the leading subspace of S (subspace iteration).
+        """
+        r=m.covRank
+        if r is None:
+            return S
+        p=S.shape[-1]
+        dg=jnp.diagonal(S,axis1=-2,axis2=-1)
+        floor=1e-6*jnp.mean(dg,axis=-1,keepdims=True)                          # keeps Psi positive
+        if r==0:
+            return jnp.maximum(dg,floor)[...,None]*jnp.eye(p,dtype=S.dtype)
+        mT=lambda A: jnp.swapaxes(A,-1,-2)
+        # initial factors from the leading subspace by subspace iteration: unlike eigh (whose gradient is not finite at
+        # repeated eigenvalues, e.g. the zeros of a covariance of few stimuli) it is smooth, so the whole fit is
+        # differentiated exactly
+        Q=jnp.broadcast_to(jnp.asarray(np.linalg.qr(np.random.default_rng(0).standard_normal((p,r)))[0],dtype=S.dtype),
+                           S.shape[:-2]+(p,r))
+        for _ in range(8):
+            Q=jnp.linalg.qr(S@Q)[0]
+        lead=jnp.diagonal(mT(Q)@S@Q,axis1=-2,axis2=-1)                         # [ ... x r ]
+        sig2=(jnp.sum(dg,axis=-1,keepdims=True)-jnp.sum(lead,axis=-1,keepdims=True))/max(p-r,1)
+        L=Q*jnp.sqrt(jnp.maximum(lead-sig2,floor))[...,None,:]
+        psi=jnp.maximum(dg-jnp.sum(L**2,axis=-1),floor)
+        I=jnp.eye(r,dtype=S.dtype)
+        def step(_,Lpsi):
+            L,psi=Lpsi
+            Sig=L@mT(L)+psi[...,None]*jnp.eye(p,dtype=S.dtype)
+            beta=mT(jnp.linalg.solve(Sig,L))                                     # [ ... x r x p ]
+            Ezz=I-beta@L+beta@S@mT(beta)
+            L=S@mT(beta)@jnp.linalg.inv(Ezz)
+            psi=jnp.maximum(jnp.diagonal(S-L@beta@S,axis1=-2,axis2=-1),floor)
+            return L,psi
+        L,psi=lax.fori_loop(0,m.nFA,step,(L,psi))
+        return L@mT(L)+psi[...,None]*jnp.eye(p,dtype=S.dtype)
+
+    @staticmethod
+    def _ctg_stats_loo(Rm,weights,m,bCentered=True):
+        """
+        own-category mean [ nStim_Ctg x nCtg x nF ] and covariance [ nStim_Ctg x nCtg x nF x nF ] of each stimulus's
+        category with that stimulus (weight w) left out: a rank-one downdate of the scatter, with shrinkage recomputed
+        """
+        wc=jnp.sum(weights,axis=0)                                               # [ nCtg ]
+        mu=jnp.sum(Rm*weights,axis=1)/wc if bCentered else jnp.zeros(Rm.shape[::2],dtype=Rm.dtype)
+        Dv=(Rm-mu[:,None,:])*jnp.sqrt(weights)
+        S=jnp.einsum('isc,jsc->cij',Dv,jnp.conj(Dv))                             # [ nCtg x nF x nF ]
+        dof=(wc-1) if bCentered else wc
+
+        d=jnp.transpose(Rm-mu[:,None,:],(1,2,0))                                 # [ nStim_Ctg x nCtg x nF ]
+        w=weights[...,None]
+        c=weights*wc/(wc-weights) if bCentered else weights                     # [ nStim_Ctg x nCtg ]
+        dS=c[...,None,None]*d[...,:,None]*jnp.conj(d)[...,None,:]
+        muL=(mu.T[None] - w*d/(wc[None,:,None]-w)) if bCentered else jnp.zeros_like(d)
+        dofL=dof[None]-weights
+        cov=(S[None]-dS)/dofL[...,None,None]
+        cov=Model._low_rank(cov,m)
+        if m.covShrink>0:
+            if m.covTarget=='pooled':
+                T=(jnp.sum(S,axis=0)[None,None]-dS)/(jnp.sum(dof)-weights)[...,None,None]
+            else:
+                T=cov*jnp.eye(cov.shape[-1],dtype=cov.dtype)
+            cov=(1-m.covShrink)*cov + m.covShrink*T
+        return muL,cov
+
+    @staticmethod
+    def _loo_needs_all(m):
+        # whether leaving a stimulus out changes the statistics of other categories too
+        return m.ctgPoolWidth is not None or (m.covShrink>0 and m.covTarget=='pooled')
+
+    @staticmethod
+    def _ctg_stats_loo_all(Rm,weights,m,Y,bCentered=True):
+        """
+        every category's mean [ nStim_Ctg x nCtg(k) x nCtg(i) x nF ] and covariance [ nStim_Ctg x nCtg(k) x nCtg(i) x nF x nF ]
+        with stimulus (l,k) left out, exactly, including category pooling (ctgPoolWidth, bPoolMeans) and the pooled
+        shrinkage target. Built from each category's own mean o_j and scatter C_j about it: a category's scatter about
+        any point a is C_j + n_j (o_j-a)(o_j-a)^H, and leaving a stimulus out downdates only its own n, o and C.
+        """
+        nF,_,nC=Rm.shape
+        wc=jnp.sum(weights,axis=0)                                               # [ nCtg ]
+        eye=jnp.eye(nC,dtype=weights.dtype)
+        if bCentered:
+            o=(jnp.sum(Rm*weights,axis=1)/wc).T                                  # [ nCtg x nF ] own means
+        else:
+            o=jnp.zeros((nC,nF),dtype=Rm.dtype)
+        Dv=(Rm-o.T[:,None,:])*jnp.sqrt(weights)
+        C=jnp.einsum('isc,jsc->cij',Dv,jnp.conj(Dv))                             # [ nCtg x nF x nF ] own scatter
+        K=eye if m.ctgPoolWidth is None else Model._ctg_kernel(Y,m.ctgPoolWidth,m._Yperiod).astype(weights.dtype)
+
+        # the left-out stimulus's own category k: counts, means, and scatter downdate
+        w=weights                                                                # [ l x k ]
+        d=jnp.transpose(Rm,(1,2,0))-o[None]                                      # [ l x k x nF ]
+        c=w*wc/(wc-w) if bCentered else w
+        dC=c[...,None,None]*d[...,:,None]*jnp.conj(d)[...,None,:]               # [ l x k x nF x nF ]
+        nL=wc[None,None,:]-w[...,None]*eye[None]                                 # [ l x k x j ]
+        oL=o[None,None]+eye[None,:,:,None]*((-w/(wc-w))[...,None]*d if bCentered else jnp.zeros_like(d))[:,:,None,:]
+        dofL=nL-1 if bCentered else nL                                           # [ l x k x j ]
+
+        # means: own, or pooled over categories
+        if bCentered and m.ctgPoolWidth is not None and m.bPoolMeans:
+            Kn=jnp.einsum('ij,lkj->lkij',K,nL)                                   # [ l x k x i x j ]
+            mu=jnp.einsum('lkij,lkjf->lkif',Kn,oL)/jnp.sum(Kn,axis=-1)[...,None]
+            # scatter of each category j about its (pooled) mean: + n_j e_j e_j^H, e_j = o_j - m_j
+            e=oL-mu
+            extra=nL[...,None,None]*e[...,:,None]*jnp.conj(e)[...,None,:]        # [ l x k x j x nF x nF ]
+        else:
+            mu=oL
+            extra=None
+
+        def pooled(Kw):
+            # sum_j Kw_ij S_j with the left-out stimulus removed: [ l x k x i x nF x nF ]
+            P=jnp.einsum('ij,jfg->ifg',Kw,C)[None,None] - Kw.T[None,:,:,None,None]*dC[:,:,None]
+            if extra is not None:
+                P=P+jnp.einsum('ij,lkjfg->lkifg',Kw,extra)
+            return P
+
+        cov=pooled(K)/jnp.einsum('ij,lkj->lki',K,dofL)[...,None,None]
+        cov=Model._low_rank(cov,m)
+        if m.covShrink>0:
+            if m.covTarget=='pooled':
+                ones=jnp.ones_like(K)
+                T=(pooled(ones)/jnp.einsum('ij,lkj->lki',ones,dofL)[...,None,None])
+            else:
+                T=cov*jnp.eye(nF,dtype=cov.dtype)
+            cov=(1-m.covShrink)*cov + m.covShrink*T
+        return mu,cov
+
+    @staticmethod
+    def _noise_loo(noiseCov,RVar,weights):
+        """
+        the noise covariance of each stimulus's own category without it [ nStim_Ctg x nCtg x nF x nF ]: the mean noise
+        variances are recomputed without the stimulus, keeping the correlations
+        """
+        wc=jnp.sum(weights,axis=0)
+        v=(jnp.sum(RVar*weights,axis=1)/wc).T                                     # [ nCtg x nF ]
+        w=weights[...,None]
+        vL=(wc[None,:,None]*v[None]-w*jnp.transpose(RVar,(1,2,0)))/(wc[None,:,None]-w)
+        sc=jnp.sqrt(_safe_divide(vL,v[None]))
+        return noiseCov[None]*sc[...,:,None]*sc[...,None,:]
+
+    @staticmethod
+    def _noise_all(noiseCov,noiseL):
+        # [ nStim_Ctg x nCtg(k) x nCtg(i) x nF x nF ]: the left-out noise for the own category (i = k), else the category's
+        eye=jnp.eye(noiseCov.shape[0],dtype=bool)[None,:,:,None,None]
+        return jnp.where(eye,noiseL[:,:,None],noiseCov[None,None])
+
+    @staticmethod
+    def _loo_prior(weights):
+        # log (N_k - w)/N_k: the own category's prior without the stimulus (the common 1/(N-1) cancels in the posterior)
+        wc=jnp.sum(weights,axis=0)
+        return jnp.log(jnp.where(weights>0,(wc-weights)/wc,1.))
+
+    @staticmethod
+    def _add_own(lAll,v):
+        # add v [ nStim_Ctg x nCtg ] to lAll[l,k,k]
+        return lAll + jnp.eye(lAll.shape[-1],dtype=lAll.dtype)[None]*v[:,:,None]
+
+    @staticmethod
+    def _set_own(lAll,own):
+        # replace lAll[l,k,k] with own [ nStim_Ctg x nCtg ]
+        return jnp.where(jnp.eye(lAll.shape[-1],dtype=bool)[None],own[:,:,None],lAll)
 
     #- response: which responses are decoded. returns observed, mean, variance
     @staticmethod
@@ -1499,25 +1901,46 @@ class Model(_Static):
 
     #- models
     @staticmethod
-    def _model__gss(R,Rm,RVar,noiseCov,noiseCorr,weights,bLeaveOneOut=False,m=None,Y=None):
+    def _model__gss(R,Rm,RVar,noiseCov,noiseCorr,weights,bLeaveOneOut=False,m=None,Y=None,refIdx=None):
         #: R, Rm [ nF x nStim_Ctg x nCtg ]
         #: lAll  [ nStim_Ctg x nCtg x nCtg ]
-        mu,cov=Model._ctg_stats(Rm,weights,Model() if m is None else m,Y)
+        m=Model() if m is None else m
+        mu,cov=Model._ctg_stats(Rm,weights,m,Y)
         cov=cov + noiseCov
 
         x=jnp.transpose(R,(1,2,0))[:,:,None,:] - mu.T[None,None,:,:]         # [ nStim_Ctg x nCtg x nCtg x nF ]
-        return lmvn0(x,cov[None,None])
+        lAll=lmvn0(x,cov[None,None])
+        if bLeaveOneOut and Model._loo_needs_all(m):
+            muL,covL=Model._ctg_stats_loo_all(Rm,weights,m,Y)
+            noiseL=Model._noise_all(noiseCov,Model._noise_loo(noiseCov,RVar,weights))
+            lAll=Model._add_own(lmvn0(jnp.transpose(R,(1,2,0))[:,:,None,:]-muL,covL+noiseL),Model._loo_prior(weights))
+        elif bLeaveOneOut:
+            muL,covL=Model._ctg_stats_loo(Rm,weights,m)
+            noiseL=Model._noise_loo(noiseCov,RVar,weights)
+            lAll=Model._set_own(lAll,lmvn0(jnp.transpose(R,(1,2,0))-muL,covL+noiseL) + Model._loo_prior(weights))
+        return lAll
 
     @staticmethod
-    def _model__student(R,Rm,RVar,noiseCov,noiseCorr,weights,bLeaveOneOut=False,m=None,Y=None):
+    def _model__student(R,Rm,RVar,noiseCov,noiseCorr,weights,bLeaveOneOut=False,m=None,Y=None,refIdx=None):
         # multivariate t with covariance cov + noiseCov: scale = cov * (df-2)/df
         mu,cov=Model._ctg_stats(Rm,weights,m,Y)
         scale=(cov + noiseCov)*(m.df-2)/m.df
         x=jnp.transpose(R,(1,2,0))[:,:,None,:] - mu.T[None,None,:,:]
-        return lmvt0(x,scale[None,None],m.df)
+        lAll=lmvt0(x,scale[None,None],m.df)
+        if bLeaveOneOut and Model._loo_needs_all(m):
+            muL,covL=Model._ctg_stats_loo_all(Rm,weights,m,Y)
+            noiseL=Model._noise_all(noiseCov,Model._noise_loo(noiseCov,RVar,weights))
+            lAll=Model._add_own(lmvt0(jnp.transpose(R,(1,2,0))[:,:,None,:]-muL,(covL+noiseL)*(m.df-2)/m.df,m.df),
+                                Model._loo_prior(weights))
+        elif bLeaveOneOut:
+            muL,covL=Model._ctg_stats_loo(Rm,weights,m)
+            noiseL=Model._noise_loo(noiseCov,RVar,weights)
+            lAll=Model._set_own(lAll,lmvt0(jnp.transpose(R,(1,2,0))-muL,(covL+noiseL)*(m.df-2)/m.df,m.df)
+                                + Model._loo_prior(weights))
+        return lAll
 
     @staticmethod
-    def _model__circ(R,Rm,RVar,noiseCov,noiseCorr,weights,bLeaveOneOut=False,m=None,Y=None):
+    def _model__circ(R,Rm,RVar,noiseCov,noiseCorr,weights,bLeaveOneOut=False,m=None,Y=None,refIdx=None):
         # flattened responses hold the real parts of all complex dimensions, then the imaginary parts
         h=R.shape[0]//2
         Rc=R[:h]+1j*R[h:]
@@ -1527,13 +1950,124 @@ class Model(_Static):
         if bZero:
             mu=jnp.zeros_like(mu)
         # circular noise: the complex variance is the sum of the real and imaginary component (co)variances
-        Nc=noiseCov[:,:h,:h] + noiseCov[:,h:,h:]
+        blocks=lambda M: M[...,:h,:h] + M[...,h:,h:]
+        Nc=blocks(noiseCov)
         cov=cov + Nc.astype(cov.dtype)
         x=jnp.transpose(Rc,(1,2,0))[:,:,None,:] - mu.T[None,None,:,:]
-        return lcn0(x,cov[None,None])
+        lAll=lcn0(x,cov[None,None])
+        if bLeaveOneOut and Model._loo_needs_all(m):
+            muL,covL=Model._ctg_stats_loo_all(Rmc,weights,m,Y,bCentered=not bZero)
+            NcL=blocks(Model._noise_all(noiseCov,Model._noise_loo(noiseCov,RVar,weights)))
+            lAll=Model._add_own(lcn0(jnp.transpose(Rc,(1,2,0))[:,:,None,:]-muL,covL+NcL.astype(covL.dtype)),Model._loo_prior(weights))
+        elif bLeaveOneOut:
+            muL,covL=Model._ctg_stats_loo(Rmc,weights,m,bCentered=not bZero)
+            NcL=blocks(Model._noise_loo(noiseCov,RVar,weights))
+            lAll=Model._set_own(lAll,lcn0(jnp.transpose(Rc,(1,2,0))-muL,covL+NcL.astype(covL.dtype)) + Model._loo_prior(weights))
+        return lAll
 
     @staticmethod
-    def _model__full(R,Rm,RVar,noiseCov,noiseCorr,weights,bLeaveOneOut=False,m=None,Y=None):
+    def _mix_fit(Rm,weights,m,state=None,bDetail=False):
+        """
+        gaussian mixture of each category's mean responses Rm [ nF x nStim_Ctg x nCtg ]: weights pi [ nCtg x nMix ],
+        means [ nCtg x nMix x nF ], covariances [ nCtg x nMix x nF x nF ]. state: a previous fit (pi, mu, cov) to start
+        EM from (nEMWarm iterations) instead of the principal-axis initialization (nEM iterations). bDetail: also
+        return a dict of the final responsibilities, component counts and scatters (for leave-one-out)
+        """
+        K=m.nMix
+        X=jnp.transpose(Rm,(2,1,0))                                              # [ nCtg x nStim_Ctg x nF ]
+        w=weights.T                                                              # [ nCtg x nStim_Ctg ]
+        n=jnp.sum(w,axis=1)
+        nF=X.shape[-1]
+        mu0=jnp.sum(w[...,None]*X,axis=1)/n[:,None]
+        D0=X-mu0[:,None]
+        cov0=jnp.einsum('cs,csf,csg->cfg',w,D0,D0)/(n-1)[:,None,None]
+        ridge=m.mixReg*jnp.trace(cov0,axis1=-2,axis2=-1)/nF                     # [ nCtg ]
+        eye=jnp.eye(nF,dtype=X.dtype)
+
+        def mstep(r,bBessel=False):
+            # maximum likelihood during EM (so it converges to the ML mixture); the returned fit is Bessel corrected
+            Nc=jnp.sum(r,axis=1)                                                 # [ nCtg x nMix ]
+            Ns=jnp.where(Nc>1e-8,Nc,1.)
+            mu=jnp.einsum('csk,csf->ckf',r,X)/Ns[...,None]
+            D=X[:,None]-mu[:,:,None]                                             # [ nCtg x nMix x nStim_Ctg x nF ]
+            S=jnp.einsum('csk,cksf,cksg->ckfg',r,D,D)
+            # an empty component keeps the category covariance (its weight is 0); its denominator must stay nonzero, or
+            # the masked 0/0 still makes the gradient nan (a warm start carries an empty component along)
+            live=(Nc>1e-8)[...,None,None]
+            den=jnp.where(Nc>1e-8,jnp.maximum(Nc-1,Nc/2),1.) if bBessel else Ns
+            cov=Model._low_rank(S/den[...,None,None],m) + ridge[:,None,None,None]*eye
+            cov=jnp.where(live,cov,cov0[:,None]+ridge[:,None,None,None]*eye)
+            pi=Nc/n[:,None]
+            return pi,mu,cov,Nc,S
+
+        def estep(pi,mu,cov):
+            l=lmvn0(X[:,:,None,:]-mu[:,None],cov[:,None]) + jnp.log(jnp.where(pi>0,pi,1.))[:,None] \
+              + jnp.where(pi>0,0.,-jnp.inf)[:,None]                               # [ nCtg x nStim_Ctg x nMix ]
+            return jnp.exp(l-logsumexp(l,axis=-1,keepdims=True))*w[...,None]
+
+        # initial responsibilities: quantile groups along the first principal axis of each category
+        def init():
+            v=jnp.linalg.eigh(lax.stop_gradient(cov0))[1][...,-1]                # [ nCtg x nF ]
+            sc=jnp.where(w>0,jnp.einsum('csf,cf->cs',lax.stop_gradient(D0),v),jnp.inf)
+            rank=jnp.argsort(jnp.argsort(sc,axis=1),axis=1)
+            grp=jnp.clip(jnp.floor(rank*K/n[:,None]).astype(int),0,K-1)
+            return jax.nn.one_hot(grp,K,dtype=X.dtype)*w[...,None]
+
+        # the EM iterations are differentiated (unrolled; only the responsibilities are kept per iteration), so the
+        # gradient includes how the fit moves with the filters
+        if state is not None:
+            r,nIter=estep(*[lax.stop_gradient(a) for a in state]),m.nEMWarm
+        else:
+            r,nIter=init(),m.nEM
+        if K>1:
+            r=lax.fori_loop(0,nIter,lambda _,r: estep(*mstep(r)[:3]),r)
+        pi,mu,cov,Nc,S=mstep(r,bBessel=True)
+        if bDetail:
+            # state: the maximum likelihood components (EM's fixed point), for a warm start
+            return (pi,mu,cov),dict(r=r,Nc=Nc,S=S,n=n,cov0=cov0,ridge=ridge,state=mstep(r)[:3])
+        return pi,mu,cov
+
+    @staticmethod
+    def _model__mix(R,Rm,RVar,noiseCov,noiseCorr,weights,bLeaveOneOut=False,m=None,Y=None,refIdx=None):
+        return Model._mix_likelihoods(R,Rm,noiseCov,weights,bLeaveOneOut,m,RVar=RVar)[0]
+
+    @staticmethod
+    def _logpi(pi):
+        return jnp.log(jnp.where(pi>0,pi,1.)) + jnp.where(pi>0,0.,-jnp.inf)
+
+    @staticmethod
+    def _mix_likelihoods(R,Rm,noiseCov,weights,bLeaveOneOut,m,state=None,RVar=None):
+        """
+        lAll[l,k,i] = log sum_c pi_ic N(R[:,l,k]; mu_ic, Sigma_ic + noiseCov_i), and the fit (the state to start the
+        next EM from)
+        """
+        fit,det=Model._mix_fit(Rm,weights,m,state,bDetail=True)
+        pi,mu,cov=fit
+        x=jnp.transpose(R,(1,2,0))                                               # [ nStim_Ctg x nCtg x nF ]
+        l=lmvn0(x[:,:,None,None,:]-mu[None,None],(cov+noiseCov[:,None])[None,None]) + Model._logpi(pi)[None,None]
+        lAll=logsumexp(l,axis=-1)                                                # [ nStim_Ctg x nCtg x nCtg ]
+        if bLeaveOneOut:
+            # own category without stimulus (l,k): remove its responsibility-weighted share a_c from each component
+            a=jnp.transpose(det['r'],(1,0,2))                                    # [ l x k x nMix ]
+            Nc,S,n=det['Nc'][None],det['S'][None],det['n'][None,:,None]
+            d=x[:,:,None,:]-mu[None]                                             # [ l x k x nMix x nF ]
+            NL=Nc-a
+            live=NL>1e-8
+            NLs=jnp.where(live,NL,1.)
+            muL=mu[None]-(a/NLs)[...,None]*d
+            SL=S-(a*Nc/NLs)[...,None,None]*d[...,:,None]*d[...,None,:]
+            eye=jnp.eye(x.shape[-1],dtype=x.dtype)
+            ridge=det['ridge'][None,:,None,None,None]
+            covL=Model._low_rank(SL/jnp.where(live,jnp.maximum(NL-1,NL/2),1.)[...,None,None],m) + ridge*eye
+            covL=jnp.where(live[...,None,None],covL,det['cov0'][None,:,None]+ridge*eye)
+            piL=jnp.where(live,NL,0.)/(n-weights[...,None])
+            noiseL=Model._noise_loo(noiseCov,RVar,weights)
+            own=logsumexp(lmvn0(x[:,:,None,:]-muL,covL+noiseL[:,:,None]) + Model._logpi(piL),axis=-1)
+            lAll=Model._set_own(lAll,own + Model._loo_prior(weights))
+        return lAll,tuple(lax.stop_gradient(v) for v in det['state'])
+
+    @staticmethod
+    def _model__full(R,Rm,RVar,noiseCov,noiseCorr,weights,bLeaveOneOut=False,m=None,Y=None,refIdx=None):
         #: lAll[l,k,i] = log mean_j N(R[:,l,k]; Rm[:,j,i], S_ji P S_ji),  S_ji = diag(sqrt(RVar[:,j,i]))
         #: P is the noise correlation matrix (identity when noiseCorr is None). Quadratic forms are expanded in R, so no
         #: [ nF x l x j x i ] tensor is formed.
@@ -1559,16 +2093,32 @@ class Model(_Static):
             B=a[:,None]*a[None,:]*Pinv[:,:,None,None]                              # [ nF x nF x j x i ]
             quad=lambda Rk: jnp.einsum('fl,gl,fgji->lji',Rk,Rk,B)
 
-        nStim,nCtg=weights.shape
-        self_match=jnp.eye(nStim,dtype=bool)[:,:,None]                             # [ l x j x 1 ]
+        nCtg=weights.shape[1]
+        # reference j of category i is observed stimulus refIdx[j,i] of that category (all of them, in order, by default)
+        if refIdx is None:
+            refIdx=jnp.broadcast_to(jnp.arange(weights.shape[0])[:,None],weights.shape)
+        # observed stimuli in chunks, so the [ l x j x i ] terms stay below _FULL_CHUNK elements (large training sets)
+        nObs=R.shape[1]
+        lc=min(nObs,max(1,_FULL_CHUNK//(weights.shape[0]*nCtg)))
+        nCh=-(-nObs//lc)
+
+        def chunk(Rc,li,k):
+            # Rc [ nF x lc ] observed stimuli li of true category k -> [ lc x nCtg(i) ]
+            q=-0.5*quad(Rc) + jnp.einsum('fl,fji->lji',Rc,aPm) + c[None]
+            if bLeaveOneOut:
+                self_match=(li[:,None,None]==refIdx[None]) & (jnp.arange(nCtg)==k)[None,None,:]
+                q=jnp.where(self_match,-jnp.inf,q)
+            return logsumexp(q,axis=1)
 
         def per_true_ctg(args):
             # Rk [ nF x nStim_Ctg(l) ] of true category k -> [ nStim_Ctg(l) x nCtg(i) ]
             Rk,k=args
-            q=-0.5*quad(Rk) + jnp.einsum('fl,fji->lji',Rk,aPm) + c[None]
-            if bLeaveOneOut:
-                q=jnp.where(self_match & (jnp.arange(nCtg)==k)[None,None,:],-jnp.inf,q)
-            return logsumexp(q,axis=1)
+            if nCh==1:
+                return chunk(Rk,jnp.arange(nObs),k)
+            Rp=jnp.pad(Rk,((0,0),(0,nCh*lc-nObs)))                               # padded observations are dropped
+            Rch=jnp.moveaxis(Rp.reshape(nF,nCh,lc),1,0)
+            out=lax.map(lambda a: chunk(a[0],a[1],k),(Rch,jnp.arange(nCh*lc).reshape(nCh,lc)))
+            return out.reshape(nCh*lc,nCtg)[:nObs]
 
         # dividing by N_i also for the left-out category keeps the posterior (with the prior N_i/N) in Eq 5's sum form
         lAll=lax.map(per_true_ctg,(jnp.moveaxis(R,-1,0),jnp.arange(nCtg))) - jnp.log(wc)[None,None,:]  # [ nCtg(k) x nStim_Ctg x nCtg ]
@@ -1586,6 +2136,20 @@ class Objective(_Static):
         'mle' -log p(R|X_k) at the correct level
         'l2'  (Xhat - X_k)^2, estType defaults to posterior 'mean' (MMSE, Eq 13-15)
         'l1'  |Xhat - X_k|,   estType defaults to posterior 'median'
+    Divergences between the posterior over levels p and a target q around X_k (targetSigma):
+        'xent'        cross-entropy -sum_i q_i log p_i; equals 'map' with the one-hot target
+        'js'          Jensen-Shannon divergence, bounded by log 2
+        'wasserstein' 1-Wasserstein (earth mover's) distance over Y, sum |F_p - F_q| dY;
+                      with the one-hot target the posterior mean of |Y - X_k|
+        'fisher'      Fisher divergence sum q (s_p - s_q)^2 of the scores s = d log / dY, as finite differences
+                      between neighbouring levels (independent of the posterior's normalization); needs targetSigma
+        With several latent dimensions (euclidean distance, wrapped on circular dimensions): 'wasserstein' is exact for the
+        one-hot target (the posterior mean distance to X_k) and the debiased entropic (Sinkhorn) divergence for a gaussian
+        target (otEps, nOtIter); 'fisher' needs the levels on a cartesian grid and sums the per-axis divergences.
+
+    Several latent dimensions: 'l1' and 'l2' sum over them (L1 and squared euclidean distance), 'mean' and 'median'
+    estimate each dimension (the marginal median minimizes the expected L1 distance), and the gaussian target is
+    isotropic. Circular dimensions (Stim Yperiod) wrap all differences, and 'mean' is their circular mean.
     """
     _posterior_fun=_id
     _est_fun=_id
@@ -1595,8 +2159,17 @@ class Objective(_Static):
     estType=_TypeFunc()
     errType=_TypeFunc()
     lossType=_TypeFunc()
-    def __init__(self,errType='map',bPosterior=None,estType=None,lossType='mean',regType='None',regWeight=0.,_bCopy=False):
+    _DIVERGENCES=('xent','js','wasserstein','fisher')
+    _Yperiod=None                                                               # from the Stim, set by Unit._set_geometry
+    _Ygrid=None                                                                 # _latent_grid of the Stim's Y
+    def __init__(self,errType='map',bPosterior=None,estType=None,lossType='mean',regType='None',regWeight=0.,targetSigma=None,
+                 otEps=0.05,nOtIter=200,_bCopy=False):
         """
+        targetSigma - target distribution over the levels for the divergence errTypes: None for one-hot at X_k, or the
+                      standard deviation (in units of Y) of a gaussian target q_i ~ exp(-(Y_i - X_k)^2 / 2 targetSigma^2)
+        otEps, nOtIter - 'wasserstein' with several latent dimensions and a gaussian target: the debiased entropic
+                      (Sinkhorn) divergence with regularization otEps times the mean distance between levels, from nOtIter
+                      Sinkhorn iterations (smaller otEps approaches the exact distance but needs more iterations)
         regType   - penalty on the filters while training (not included in Unit.loss; see Unit.penalty), in the
                     learning domain (spatial, or fourier for fourierType >= 1), over the learned coefficients:
                     'None'
@@ -1617,6 +2190,13 @@ class Objective(_Static):
             errType='l' + str(int(errType))
         self.errType=errType
         self.lossType=lossType
+        self.targetSigma=None if targetSigma is None else float(targetSigma)
+        if self.targetSigma is not None and not self.targetSigma>0:
+            raise Exception('targetSigma must be None or positive')
+        self.otEps=float(otEps)
+        self.nOtIter=int(nOtIter)
+        if not self.otEps>0 or self.nOtIter<1:
+            raise Exception('otEps must be positive and nOtIter at least 1')
 
         if _bCopy:
             self.bPosterior=bPosterior
@@ -1624,20 +2204,24 @@ class Objective(_Static):
             return
 
         #- posterior
+        if self.errType=='fisher' and self.targetSigma is None:
+            raise Exception("errType='fisher' needs a gaussian target (targetSigma): the one-hot target has no score")
+        if self.targetSigma is not None and self.errType not in self._DIVERGENCES:
+            raise Exception('targetSigma is only used by errType ' + ', '.join(self._DIVERGENCES))
         if   self.errType == 'mle':
             if bPosterior:
                 raise Exception('bPosterior must not be set for errType=mle')
             bPosterior=False
-        elif self.errType == 'map':
+        elif self.errType == 'map' or self.errType in self._DIVERGENCES:
             if bPosterior is False:
-                raise Exception('bPosterior must not be False for errType=map')
+                raise Exception('bPosterior must not be False for errType=' + self.errType)
             bPosterior=True
         elif bPosterior is None:
             bPosterior=True
         self.bPosterior=bPosterior
 
         #- estType
-        if self.errType in ('mle','map'):
+        if self.errType in ('mle','map') + self._DIVERGENCES:
             if estType is not None:
                 raise Exception('estType must not be set for errType=' + self.errType)
         elif estType is None:
@@ -1646,7 +2230,11 @@ class Objective(_Static):
 
 
     def _key(self):
-        return (self.errType,self.bPosterior,self.estType,self.lossType,str(self.regType).lower(),self.regWeight)
+        return (self.errType,self.bPosterior,self.estType,self.lossType,str(self.regType).lower(),self.regWeight,self.targetSigma,
+                self.otEps,self.nOtIter,self._Yperiod,self._Ygrid)
+
+    def _err_opts(self):
+        return _ErrOpts(self._Ygrid,self.targetSigma is None,self.otEps,self.nOtIter)
 
     def copy(self):
        return Objective(**_get_copy_dict(self),_bCopy=True)
@@ -1655,7 +2243,16 @@ class Objective(_Static):
     def lrn_main(self,lAll,stimweights,yCtg,Y,priorweights=None):
         # the prior comes from priorweights (the training stimuli) when decoding other stimuli
         prior=stimweights if priorweights is None else priorweights
-        return self._loss_fun(self._err_fun(self._est_fun(self._posterior_fun(lAll,prior),Y),yCtg),stimweights)
+        per=self._Yperiod
+        return self._loss_fun(self._err_fun(self._est_fun(self._posterior_fun(lAll,prior),Y,per),yCtg,self.log_target(Y),Y,per,
+                                            self._err_opts()),stimweights)
+
+    def log_target(self,Y):
+        """log target distribution [ nCtg (correct) x nCtg ] over the levels for the divergence errTypes"""
+        if self.targetSigma is None:
+            return jnp.where(jnp.eye(len(Y),dtype=bool),0.,-jnp.inf).astype(Y.dtype)
+        lq=-_ydist2(Y,self._Yperiod)/(2*self.targetSigma**2)
+        return lq - logsumexp(lq,axis=-1,keepdims=True)
 
     #- posterior (log domain)
     @staticmethod
@@ -1674,48 +2271,192 @@ class Objective(_Static):
     def _prob(lpost):
         return jnp.exp(lpost - logsumexp(lpost,axis=-1,keepdims=True))
 
+    # estimates [ ... ] for 1-D Y, [ ... x nDim ] for several latent dimensions
     @staticmethod
-    def _est__none(lpost,Y):
+    def _est__none(lpost,Y,per=None):
         return lpost
 
     @staticmethod
-    def _est__median(lpost,Y):
-        # cdf over latent values in ascending order (Y need not be sorted)
-        order=jnp.argsort(Y)
-        cdf=jnp.cumsum(Objective._prob(lpost)[...,order],axis=-1)
-        interp=lambda c: jnp.interp(0.5,c,Y[order])
-        return jnp.vectorize(interp,signature='(n)->()')(cdf)
+    def _est__median(lpost,Y,per=None):
+        # (marginal) median: cdf over latent values in ascending order (Y need not be sorted)
+        p=Objective._prob(lpost)
+        def median(y):
+            order=jnp.argsort(y)
+            cdf=jnp.cumsum(p[...,order],axis=-1)
+            return jnp.vectorize(lambda c: jnp.interp(0.5,c,y[order]),signature='(n)->()')(cdf)
+        def circ_median(y,P):
+            # the circular median m minimizes the expected wrapped distance, and the diameter through m halves the
+            # probability: find it among the levels and their antipodes (no gradient), cut the circle at its antipode,
+            # and take the median of the unwrapped distribution
+            cand=jnp.concatenate((y,y+P/2))
+            dist=jnp.abs(_wrap(y[:,None]-cand[None,:],(P,)))                     # [ nCtg x 2 nCtg ]
+            m0=lax.stop_gradient(cand[jnp.argmin(p@dist,axis=-1)])                 # [ ... ]
+            yu=m0[...,None]+_wrap(y-m0[...,None],(P,))                             # [ ... x nCtg ]
+            order=jnp.argsort(yu,axis=-1)
+            cdf=jnp.cumsum(jnp.take_along_axis(p,order,axis=-1),axis=-1)
+            ys=jnp.take_along_axis(yu,order,axis=-1)
+            return _wrap(jnp.vectorize(lambda c,v: jnp.interp(0.5,c,v),signature='(n),(n)->()')(cdf,ys),(P,))
+        if Y.ndim==1:
+            return median(Y) if per is None else circ_median(Y,per[0])
+        pd=per if per is not None else (None,)*Y.shape[1]
+        return jnp.stack([median(Y[:,d]) if pd[d] is None else circ_median(Y[:,d],pd[d]) for d in range(Y.shape[1])],axis=-1)
 
     @staticmethod
-    def _est__mean(lpost,Y):
-        return Objective._prob(lpost) @ Y
+    def _est__mean(lpost,Y,per=None):
+        # posterior mean; on circular dimensions the circular mean
+        p=Objective._prob(lpost)
+        m=p @ Y
+        if per is None:
+            return m
+        P,bC=_period_arrays(per,Y.dtype)
+        if Y.ndim==1:
+            P,bC=P[0],bC[0]
+        # zero phase on linear dimensions keeps angle() away from 0, where its gradient is not finite
+        mc=jnp.angle(p @ jnp.exp(1j*jnp.where(bC,2*jnp.pi*Y/P,0.)))*P/(2*jnp.pi)
+        return jnp.where(bC,mc,m)
 
     @staticmethod
-    def _est__mode(lpost,Y):
+    def _est__mode(lpost,Y,per=None):
         # MAP estimate; piecewise constant, so provides no gradient
         return Y[jnp.argmax(lpost,axis=-1)]
 
     @staticmethod
-    def _est__cmean(lpost,Y):
-        # circular mean, Y in radians
+    def _est__cmean(lpost,Y,per=None):
+        # circular mean, Y in radians (see also Stim Yperiod, with which 'mean' is circular)
         return jnp.angle(Objective._prob(lpost) @ jnp.exp(1j*Y))
 
     #- error
     @staticmethod
-    def _err__mle(lAll,_):
+    def _err__mle(lAll,yCtg=None,lQ=None,Y=None,per=None,opts=None):
         return -Objective._at_correct(lAll)
 
     @staticmethod
-    def _err__map(lpost,_):
+    def _err__map(lpost,yCtg=None,lQ=None,Y=None,per=None,opts=None):
         return -Objective._at_correct(lpost)
 
     @staticmethod
-    def _err__l1(yHat,yCtg):
-        return jnp.abs(yHat-yCtg)
+    def _err__l1(yHat,yCtg=None,lQ=None,Y=None,per=None,opts=None):
+        d=jnp.abs(_wrap(yHat-yCtg,per))
+        return d if Y is None or Y.ndim==1 else jnp.sum(d,axis=-1)
 
     @staticmethod
-    def _err__l2(yHat,yCtg):
-        return jnp.abs(yHat-yCtg)**2
+    def _err__l2(yHat,yCtg=None,lQ=None,Y=None,per=None,opts=None):
+        d=jnp.abs(_wrap(yHat-yCtg,per))
+        return d**2 if Y is None or Y.ndim==1 else jnp.sum(d**2,axis=-1)
+
+    # divergences: lpost [ nStim_Ctg x nCtg x nCtg ] against the target row of each correct level, lQ [ nCtg x nCtg ]
+    @staticmethod
+    def _err__xent(lpost,yCtg=None,lQ=None,Y=None,per=None,opts=None):
+        q=jnp.exp(lQ)
+        return -jnp.sum(jnp.where(q>0,q*lpost,0),axis=-1)
+
+    @staticmethod
+    def _err__js(lpost,yCtg=None,lQ=None,Y=None,per=None,opts=None):
+        # 0 log 0 = 0; lQ is -inf off the one-hot target, so both logs go through where
+        p,q=jnp.exp(lpost),jnp.exp(lQ)
+        lm=jnp.logaddexp(lpost,lQ)-jnp.log(2.)
+        lms=jnp.where((p>0)|(q>0),lm,0)
+        tp=jnp.where(p>0,p*(jnp.where(p>0,lpost,0)-lms),0)
+        tq=jnp.where(q>0,q*(jnp.where(q>0,lQ,0)-lms),0)
+        return 0.5*jnp.sum(tp+tq,axis=-1)
+
+    @staticmethod
+    def _err__wasserstein(lpost,yCtg=None,lQ=None,Y=None,per=None,opts=None):
+        if Y.ndim>1:
+            return Objective._wasserstein_nd(lpost,lQ,Y,per,opts or _ErrOpts())
+        # both distributions sit on the levels, so their cdfs are constant between neighbouring levels
+        y,order,dY=Objective._levels(Y,per)
+        dF=jnp.cumsum(jnp.exp(lpost)[...,order] - jnp.exp(lQ)[...,order],axis=-1)
+        if per is None:
+            return jnp.sum(jnp.abs(dF[...,:-1])*dY,axis=-1)
+        # on a circle the cdf difference is defined up to a constant, W1 = min_c sum |dF - c| dY: c is the dY-weighted median
+        o=jnp.argsort(dF,axis=-1)
+        cw=jnp.cumsum(dY[o],axis=-1)
+        c=jnp.take_along_axis(jnp.take_along_axis(dF,o,axis=-1),jnp.argmax(cw>=cw[...,-1:]/2,axis=-1)[...,None],axis=-1)
+        return jnp.sum(jnp.abs(dF-c)*dY,axis=-1)
+
+    @staticmethod
+    def _wasserstein_nd(lpost,lQ,Y,per,opts):
+        # euclidean ground distance between levels (wrapped on circular dimensions)
+        D=jnp.sqrt(_ydist2(Y,per))
+        if opts.bOneHot:
+            # all the target's mass sits at X_k: the posterior mean distance to it, exactly
+            return jnp.sum(jnp.exp(lpost)*D[None],axis=-1)
+        n=D.shape[0]
+        eps=opts.otEps*jnp.sum(D)/(n*(n-1))
+        ot=lambda la,lb: _sinkhorn_value(la,lb,D,eps,opts.nOtIter)
+        # Sinkhorn divergence: 0 at the target
+        return ot(lpost,lQ[None]) - 0.5*ot(lpost,lpost) - 0.5*ot(lQ,lQ)[None]
+
+    @staticmethod
+    def _err__fisher(lpost,yCtg=None,lQ=None,Y=None,per=None,opts=None):
+        # scores at the midpoints between neighbouring levels (on a circle also the last and first), weighted by the
+        # target there
+        if Y.ndim>1:
+            return Objective._fisher_grid(lpost,lQ,Y,per,opts)
+        y,order,dY=Objective._levels(Y,per)
+        lp,lq=lpost[...,order],lQ[...,order]
+        nxt=lambda a: jnp.roll(a,-1,axis=-1) if per is not None else a[...,1:]
+        cur=lambda a: a if per is not None else a[...,:-1]
+        sp=(nxt(lp)-cur(lp))/dY
+        sq=(nxt(lq)-cur(lq))/dY
+        q=jnp.exp(lq)
+        w=(nxt(q)+cur(q))/2
+        return jnp.sum(w*(sp-sq)**2,axis=-1)/jnp.sum(w,axis=-1)
+
+    @staticmethod
+    def _fisher_grid(lpost,lQ,Y,per,opts):
+        # levels on a cartesian grid: finite-difference scores along each axis (wrapping on circular axes); the sum over
+        # axes of the target-weighted mean squared score difference along that axis (the 1-D formula per axis)
+        if opts is None or opts.grid is None:
+            raise Exception("errType='fisher' with several latent dimensions needs the levels on a cartesian grid")
+        shape,order=opts.grid
+        order=jnp.asarray(order)
+        lp=lpost[...,order].reshape(lpost.shape[:-1]+shape)
+        lq=lQ[...,order].reshape(lQ.shape[:-1]+shape)
+        Yg=Y[order].reshape(shape+(Y.shape[1],))
+        nd=len(shape)
+        tot=0.
+        for d in range(nd):
+            if shape[d]<2:                                                   # no neighbours along this axis
+                continue
+            ax=-nd+d
+            bCirc=per is not None and per[d] is not None
+            if bCirc:
+                nxt=lambda a: jnp.roll(a,-1,axis=ax)
+                cur=lambda a: a
+            else:
+                nxt=lambda a: lax.slice_in_dim(a,1,None,axis=a.ndim+ax)
+                cur=lambda a: lax.slice_in_dim(a,0,a.shape[a.ndim+ax]-1,axis=a.ndim+ax)
+            # spacing along axis d (the same at every position of the other axes); circular axes span less than a period
+            # (Unit._check), so ascending values are in circular order
+            yd=Yg[(0,)*d+(slice(None),)+(0,)*(nd-d-1)+(d,)]
+            dY=jnp.diff(jnp.concatenate((yd,yd[:1]+per[d]))) if bCirc else jnp.diff(yd)
+            dY=dY.reshape((-1,)+(1,)*(nd-d-1))
+            sp=(nxt(lp)-cur(lp))/dY
+            sq=(nxt(lq)-cur(lq))/dY
+            q=jnp.exp(lq)
+            w=(nxt(q)+cur(q))/2
+            ax_sum=tuple(range(-nd,0))
+            tot=tot+jnp.sum(w*(sp-sq)**2,axis=ax_sum)/jnp.sum(w,axis=ax_sum)
+        return tot
+
+    @staticmethod
+    def _levels(Y,per):
+        """
+        a single latent dimension in ascending order: positions, order, and the spacings to the next level [ nCtg-1 ],
+        or on a circle positions in [0, P) and spacings [ nCtg ] including the one from the last level around to the first
+        """
+        if Y.ndim>1:
+            raise Exception("errType 'wasserstein' and 'fisher' need a single latent dimension")
+        if per is None:
+            order=jnp.argsort(Y)
+            return Y[order],order,jnp.diff(Y[order])
+        P=per[0]
+        y=jnp.mod(Y,P)
+        order=jnp.argsort(y)
+        y=y[order]
+        return y,order,jnp.diff(jnp.concatenate((y,y[:1]+P)))
 
     #- loss (padding in the category-grouped stimuli has weight 0)
     @staticmethod
@@ -1733,10 +2474,41 @@ class Objective(_Static):
         return jnp.diagonal(inAll, axis1=-2, axis2=-1)
 
 
+def _ama_sgd(step0,stepMin,stepDecay):
+    """
+    the AMA-SGD step of Burge & Jaini (2017) and burgelab/AMA (gradSGD.m, updateSGD.m, amaR01sgdObjFunc.m) as an optax
+    transformation: each filter moves a fixed distance eps along its unit-normalized (tangent-plane) gradient, with eps
+    = max(stepMin, step0*(1-stepDecay)^t) at iteration t. Filters are the last axis of params['f']; other parameters
+    (pooling weights) take the same step along their normalized gradient. Accepting a step only when it does not raise
+    the batch cost happens in Optimizer._run_chunk.
+    """
+    def unit(g,bPerFilter):
+        axes=tuple(range(g.ndim-1)) if bPerFilter and g.ndim>1 else None
+        n=jnp.sqrt(jnp.sum(jnp.abs(g)**2,axis=axes,keepdims=bPerFilter and g.ndim>1))
+        return g/jnp.where(n>0,n,1)
+
+    def init(params):
+        return {'count':jnp.zeros((),dtype=jnp.int32)}
+
+    def update(grads,state,params=None):
+        eps=jnp.maximum(stepMin,step0*(1-stepDecay)**state['count'])
+        updates={k: -(eps*unit(g,k=='f')).astype(g.dtype) for k,g in grads.items()}
+        return updates,{'count':state['count']+1}
+
+    return optax.GradientTransformation(init,update)
+
+
 class Optimizer():
     def __init__(self,optimizerType='adam',projectionType=['l2_sphere',1],lRate0=1e-1,nIterMax=1000,f0_jxrand_fun=['ball',1],
-                 batchSize=None,nStepsPerChunk=100,bVerbose=True,nBatchMinCtg=2,patience=None):
+                 batchSize=None,nStepsPerChunk=100,bVerbose=True,nBatchMinCtg=2,patience=None,stepMin=0.,stepDecay=0.01):
         """
+        optimizerType  - any optax optimizer (e.g. 'adam', 'sgd'), with learning rate lRate0 (a number or an optax
+                         schedule), or 'ama_sgd': the step of Burge & Jaini (2017) and burgelab/AMA. Each filter moves
+                         lRate0*(1-stepDecay)^t (at least stepMin) along its unit-normalized tangent-plane gradient, and a
+                         step is kept only if it does not raise the cost of the batch it was computed on (evaluated again,
+                         with the same noise). Needs projectionType 'l2_sphere'. With batchSize, this is AMA-SGD.
+        stepMin, stepDecay - 'ama_sgd' only: the smallest step, and the fraction the step shrinks each iteration (0.01:
+                         1% per iteration, as in the paper)
         batchSize      - None for full-batch learning, or the approximate number of stimuli per iteration (AMA-SGD,
                          Burge & Jaini 2017). Each iteration draws a new random batch, stratified so every category keeps
                          its share of the training set (the prior) with at least nBatchMinCtg stimuli. Posteriors are computed
@@ -1762,6 +2534,18 @@ class Optimizer():
         self.nStepsPerChunk=nStepsPerChunk
         self.bVerbose=bVerbose
         self.patience=patience
+        self.stepMin=float(stepMin)
+        self.stepDecay=float(stepDecay)
+        if self.optimizerType=='ama_sgd':
+            if self.projectionType[0]!='l2_sphere':
+                raise Exception("optimizerType='ama_sgd' steps on the unit sphere: projectionType must be 'l2_sphere'")
+            if not isinstance(lRate0,(int,float)) or not lRate0>0 or not 0<=self.stepDecay<1 or self.stepMin<0:
+                raise Exception("optimizerType='ama_sgd' needs a positive number lRate0, 0 <= stepDecay < 1 and stepMin >= 0")
+
+    @property
+    def _bAccept(self):
+        # keep a step only if it does not raise the batch cost (AMA-SGD)
+        return self.optimizerType=='ama_sgd'
 
     def copy(self):
         return Optimizer(**_get_copy_dict(self,['loss_hist','tx','val_hist','best_step']))
@@ -1777,12 +2561,20 @@ class Optimizer():
 
     @property
     def optimizer(self):
+        # the optax optimizer (or the AMA-SGD step) as a function of the learning rate
+        if self.optimizerType=='ama_sgd':
+            return lambda lRate: _ama_sgd(float(lRate),self.stepMin,self.stepDecay)
         return getattr(optax,self.optimizerType)
 
     @property
     def tx(self):
         # one optax transformation per setting, shared by all Optimizers: a new transformation object would compile the
         # training step again (e.g. for every new Unit or cross-validation fold)
+        if self.optimizerType=='ama_sgd':
+            key=(self.optimizerType,self.lRate0,self.stepMin,self.stepDecay)
+            if key not in _TX_CACHE:
+                _TX_CACHE[key]=self.optimizer(self.lRate0)
+            return _TX_CACHE[key]
         key=(self.optimizerType,self.lRate0)
         if key not in _TX_CACHE:
             _TX_CACHE[key]=self.optimizer(self.lRate0)
@@ -1818,7 +2610,7 @@ class Optimizer():
         idx=jnp.argsort(score,axis=0)[:mMax]                                    # [ mMax x nCtg ]
         val=jnp.take_along_axis(stimval,jnp.broadcast_to(idx,stimval.shape[:-2]+idx.shape),axis=-2)
         w=jnp.take_along_axis(stimweights,idx,axis=0)*mask
-        y=jnp.take_along_axis(yCtg,idx,axis=0)
+        y=_take_stim(yCtg,idx)
         return val,w,y
 
     #- learning
@@ -1832,8 +2624,8 @@ class Optimizer():
         return g-radial*f
 
     @staticmethod
-    @partial(jit, static_argnames=['tx','loss_fun','proj_fun','proj_params','nSteps','mMax','bTangent'])
-    def _run_chunk(tx,loss_fun,proj_fun,proj_params,nSteps,mMax,bTangent,nActive,
+    @partial(jit, static_argnames=['tx','loss_fun','proj_fun','proj_params','nSteps','mMax','bTangent','bAccept','bState'])
+    def _run_chunk(tx,loss_fun,proj_fun,proj_params,nSteps,mMax,bTangent,bAccept,bState,nActive,
                    params,opt_state,rng,prepped,prepped_exp,index,index_exp,batch_mask,stimval,stimweights,yCtg,Y):
         def body(carry,i):
             params,opt_state,rng=carry
@@ -1843,13 +2635,27 @@ class Optimizer():
             else:
                 val,w,y=Optimizer._sample_batch(rng_batch,mMax,batch_mask,stimval,stimweights,yCtg)
 
-            loss_value,grads=value_and_grad(loss_fun)(params,rng_key,prepped,index,val,w,y,Y)
+            if bState:
+                # a model state (e.g. the previous mixture fit) goes in with the parameters and comes out updated
+                ost,mst=opt_state
+                cost=lambda prm: loss_fun(prm,rng_key,prepped,index,val,w,y,Y,mst)
+                (loss_value,mnew),grads=value_and_grad(cost,has_aux=True)(params)
+            else:
+                ost=opt_state
+                cost=lambda prm: loss_fun(prm,rng_key,prepped,index,val,w,y,Y)
+                loss_value,grads=value_and_grad(cost)(params)
             # complex params: jax returns the conjugate of the ascent direction
             grads=tree_util.tree_map(jnp.conjugate,grads)
             if bTangent:
                 grads=dict(grads,f=Optimizer._tangent(grads['f'],params['f']))
-            updates,new_state=tx.update(grads,opt_state,params)
+            updates,new_ost=tx.update(grads,ost,params)
+            new_state=(new_ost,mnew) if bState else new_ost
             new_params=Optimizer.insert_project_extract(optax.apply_updates(params,updates),prepped_exp,index_exp,proj_fun,proj_params)
+            if bAccept:
+                # AMA-SGD: keep the step only if the cost of this batch (same noise) does not increase
+                new_value=cost(new_params)
+                ok=(new_value[0] if bState else new_value)<=loss_value
+                new_params=tree_util.tree_map(lambda a,b: jnp.where(ok,a,b),new_params,params)
 
             # iterations past nIterMax in the last chunk leave the state unchanged
             keep=lambda new,old: tree_util.tree_map(lambda a,b: jnp.where(i<nActive,a,b),new,old)
@@ -1858,26 +2664,42 @@ class Optimizer():
         (params,opt_state,rng),losses=lax.scan(body,(params,opt_state,rng),jnp.arange(nSteps))
         return params,opt_state,rng,losses
 
-    def minimize(self,f0,rng,stim,filter,loss_fun,opt_state=None,extra_params=None,val_fun=None):
+    @staticmethod
+    @partial(jit, static_argnames=['tx','loss_fun','nSteps','mMax'])
+    def _run_generated_chunk(tx,loss_fun,nSteps,mMax,nActive,params,opt_state,rng,batch_mask,stimval,stimweights,yCtg,Y):
+        # as _run_chunk, for parameters of generated filters (no filter insertion, projection or tangent step)
+        def body(carry,i):
+            params,opt_state,rng=carry
+            rng,rng_batch,rng_key=jxrandom.split(rng,3)
+            if mMax is None:
+                val,w,y=stimval,stimweights,yCtg
+            else:
+                val,w,y=Optimizer._sample_batch(rng_batch,mMax,batch_mask,stimval,stimweights,yCtg)
+            loss_value,grads=value_and_grad(loss_fun)(params,rng_key,val,w,y,Y)
+            grads=tree_util.tree_map(jnp.conjugate,grads)
+            updates,new_state=tx.update(grads,opt_state,params)
+            new_params=optax.apply_updates(params,updates)
+            keep=lambda new,old: tree_util.tree_map(lambda a,b: jnp.where(i<nActive,a,b),new,old)
+            return (keep(new_params,params),keep(new_state,opt_state),rng),loss_value
+
+        (params,opt_state,rng),losses=lax.scan(body,(params,opt_state,rng),jnp.arange(nSteps))
+        return params,opt_state,rng,losses
+
+    def minimize_generated(self,params,rng,stim,loss_fun,val_fun=None):
+        """minimize loss_fun (a _GeneratedLoss) over params, in the same chunks, batches and early stopping as minimize"""
+        if self.optimizerType=='ama_sgd':
+            raise Exception("optimizerType='ama_sgd' learns unit-norm filters directly; use another optimizer for generated filters")
         tx=self.tx
-        proj_fun=self._projection
-        proj_params=self._projection_params
-        bTangent=self.projectionType[0]=='l2_sphere'
-        index=tuple(jnp.asarray(i) for i in filter._insert_index_jx)
-        index_exp=tuple(jnp.asarray(i) for i in filter._insert_index_exp_jx)
-
-        # f0 (and any other learned parameters, e.g. pooling weights)
-        params=self.insert_project_extract({'f':f0,**(extra_params or {})},filter.prepped_exp_jx,index_exp,proj_fun,proj_params)
-        if opt_state is None:
-            opt_state=tx.init(params)
-
-        if self.batchSize is None:
-            mMax,batch_mask=None,None
-        else:
-            mMax,batch_mask=self._batch_plan(stim.weights)
-
-        # a fixed chunk length keeps one compiled trace; the last chunk masks its extra iterations
+        mMax,batch_mask=(None,None) if self.batchSize is None else self._batch_plan(stim.weights)
         nSteps=max(1,min(self.nStepsPerChunk,self.nIterMax))
+        run=lambda params,opt_state,rng,nActive: self._run_generated_chunk(tx,loss_fun,nSteps,mMax,nActive,params,opt_state,rng,
+                                                                          batch_mask,stim.val,stim.weights,stim.yCtg,stim.Y)
+        params,_,rng=self._loop(run,nSteps,params,tx.init(params),rng,val_fun)
+        return params,rng
+
+    def _loop(self,run,nSteps,params,opt_state,rng,val_fun):
+        # chunks of nSteps iterations (a fixed length keeps one compiled trace; the last chunk masks its extra
+        # iterations), with early stopping on val_fun: best_step is the number of iterations of the kept parameters
         self.loss_hist=[]
         self.val_hist=[]
         self.best_step=None
@@ -1886,10 +2708,7 @@ class Optimizer():
         step=0
         while step < self.nIterMax:
             nActive=min(nSteps,self.nIterMax-step)
-            params,opt_state,rng,losses=self._run_chunk(tx,loss_fun,proj_fun,proj_params,nSteps,mMax,bTangent,nActive,
-                                                        params,opt_state,rng,
-                                                        filter.prepped_jx,filter.prepped_exp_jx,index,index_exp,batch_mask,
-                                                        stim.val,stim.weights,stim.yCtg,stim.Y)
+            params,opt_state,rng,losses=run(params,opt_state,rng,nActive)
             self.loss_hist.extend(np.asarray(losses)[:nActive].tolist())
             step+=nActive
 
@@ -1913,6 +2732,34 @@ class Optimizer():
             _,params,opt_state,self.best_step=best
         return params,opt_state,rng
 
+    def minimize(self,f0,rng,stim,filter,loss_fun,opt_state=None,extra_params=None,val_fun=None,mstate0=None):
+        tx=self.tx
+        proj_fun=self._projection
+        proj_params=self._projection_params
+        bTangent=self.projectionType[0]=='l2_sphere'
+        index=tuple(jnp.asarray(i) for i in filter._insert_index_jx)
+        index_exp=tuple(jnp.asarray(i) for i in filter._insert_index_exp_jx)
+
+        # f0 (and any other learned parameters, e.g. pooling weights)
+        params=self.insert_project_extract({'f':f0,**(extra_params or {})},filter.prepped_exp_jx,index_exp,proj_fun,proj_params)
+        if opt_state is None:
+            opt_state=tx.init(params)
+
+        if self.batchSize is None:
+            mMax,batch_mask=None,None
+        else:
+            mMax,batch_mask=self._batch_plan(stim.weights)
+
+        nSteps=max(1,min(self.nStepsPerChunk,self.nIterMax))
+        # mstate0: an initial model state to carry through training (returned states are the optax part only)
+        bState=mstate0 is not None
+        run=lambda params,opt_state,rng,nActive: self._run_chunk(tx,loss_fun,proj_fun,proj_params,nSteps,mMax,bTangent,self._bAccept,
+                                                                bState,nActive,params,opt_state,rng,
+                                                                filter.prepped_jx,filter.prepped_exp_jx,index,index_exp,batch_mask,
+                                                                stim.val,stim.weights,stim.yCtg,stim.Y)
+        params,opt_state,rng=self._loop(run,nSteps,params,(opt_state,mstate0) if bState else opt_state,rng,val_fun)
+        return params,(opt_state[0] if bState else opt_state),rng
+
 class Unit(_Static):
     def __init__(self,stim,nrn,model,objective,optimizer=None,seed=None,rng=None,rng_last=None,name=None):
         """name: a label for this unit, used as the title of its figures (e.g. 'mixed amplitude / natural / phase pooled')"""
@@ -1927,6 +2774,7 @@ class Unit(_Static):
         self.restart_costs=None
         self.pool_p=None          # pooling-weight parameters for Nrn readoutType (see Nrn.pool_weights)
         self.train_log=[]         # training calls, for config() / from_config()
+        self._set_geometry()
 
         if seed is None:
             seed=666
@@ -1942,6 +2790,20 @@ class Unit(_Static):
     def _key(self):
         return (self.nrn._key(),self.model._key(),self.objective._key())
 
+    def _set_geometry(self):
+        # the latent geometry (circular dimensions) of the stimuli, used by the likelihood pooling and the objective. A Model
+        # or Objective shared with a unit of another geometry is copied, so that unit keeps its own
+        per=getattr(self.stim_full,'Yperiod',None)
+        grid=_latent_grid(self.stim_full.Y) if hasattr(self.stim_full,'Y') else None
+        for name in ('model','objective'):
+            obj=getattr(self,name)
+            if getattr(obj,'_bGeometrySet',False) and (obj._Yperiod!=per or (name=='objective' and obj._Ygrid!=grid)):
+                obj=obj.copy()
+                setattr(self,name,obj)
+            obj._Yperiod=per
+            obj._bGeometrySet=True
+        self.objective._Ygrid=grid
+
     def split(self,stimInd=None):
 
         nrn=self.nrn.copy()
@@ -1951,8 +2813,11 @@ class Unit(_Static):
 
         stim=self.stim if stimInd is None else self.stim._subset(stimInd)
 
-        self.rng,rng_key = jxrandom.split(self.rng)
-        unit=Unit(stim,nrn,model,objective,optimizer=optimizer,seed=self.seed,rng=rng_key,rng_last=self.rng_last)
+        # the same key as this unit (not a new split of it), so splitting does not change what this unit does next
+        unit=Unit(stim,nrn,model,objective,optimizer=optimizer,seed=self.seed,rng=self.rng,rng_last=self.rng_last)
+        unit.pool_p=self.pool_p
+        unit.multiscale_out=getattr(self,'multiscale_out',None)
+        unit.param_out=getattr(self,'param_out',None)
 
         if self.nrn.bFinalized:
             ind=self.nrn.filter.index
@@ -2003,8 +2868,13 @@ class Unit(_Static):
         if bFourier and not jnp.issubdtype(dtype,jnp.complexfloating):
             raise Exception('fourier-domain learning requires a complex dtype')
 
-        stim=self.stim_full._finalize(dtype,None,bFourier,bSplit)
+        # a copy: the caller's Stim (which other units may share) keeps its domain and precision
+        stim=copy.copy(self.stim_full)._finalize(dtype,None,bFourier,bSplit)
         self.stim=stim if stimInd is None else stim._subset(stimInd)
+        self._stimInd=None if stimInd is None else np.atleast_1d(np.asarray(stimInd,dtype=int))
+        # results of generated filters describe only the training call that made them
+        self.multiscale_out=self.param_out=None
+        self._set_geometry()
 
         self.nrn._finalize(self.stim,
                            dtype,
@@ -2026,12 +2896,23 @@ class Unit(_Static):
         nOut={'resultant':self.nrn.filter.n+1,'resultant_only':1}.get(str(self.nrn.readoutType).lower(),self.nrn.filter.n)
         return nOut*(2 if self.nrn.bAnalytic else 1)*(self.nrn.filter.nSplit if self.nrn.bSplit else 1)
 
+    def _loo_min_count(self):
+        # stimuli per category for bLeaveOneOut: the left-out covariance needs a degree of freedom (a centered one two),
+        # unless it is pooled over categories
+        m=self.model
+        return 2 if (m.modelType=='full' or m.ctgPoolWidth is not None or (m.modelType=='circ' and m.circMean=='zero')) else 3
+
     def _check_batches(self):
-        if self.optimizer.batchSize is None or self.model.modelType not in ('gss','student','circ'):
+        if self.optimizer.batchSize is None or self.model.modelType not in ('gss','student','circ','mix'):
             return
         _,mask=self.optimizer._batch_plan(self.stim.weights)
         mMin=int(np.asarray(mask).sum(0).min())
-        if mMin < self._nDim+1:
+        if self.model.modelType=='mix' and mMin<2*self.model.nMix:
+            raise Exception("modelType='mix' needs at least 2*nMix stimuli per category in every batch; increase Optimizer nBatchMinCtg")
+        if self.model.bLeaveOneOut and mMin<self._loo_min_count():
+            raise Exception('bLeaveOneOut needs at least ' + str(self._loo_min_count()) + ' stimuli per category in every batch; '
+                            'increase Optimizer nBatchMinCtg')
+        if mMin < self._nDim+1 and self.model.covRank is None:
             warnings.warn('batches have as few as ' + str(mMin) + ' stimuli in a category, fewer than the ' + str(self._nDim+1)
                           + ' needed for a full-rank AMA-Gauss covariance of ' + str(self._nDim) + ' response dimensions; '
                           'increase batchSize or Optimizer nBatchMinCtg',stacklevel=3)
@@ -2047,15 +2928,36 @@ class Unit(_Static):
                 raise Exception("modelType='circ' needs complex quadrature-pair responses (fourierType=2)")
             if self.nrn._bWhiten:
                 raise Exception("modelType='circ' can not be combined with whitening, which mixes real and imaginary components")
-        if self.model.bLeaveOneOut is False and self.model.modelType not in ('gss','full','student','circ'):
-            raise Exception("modelType must be 'gss', 'full', 'student', or 'circ'")
+        if self.model.bLeaveOneOut is False and self.model.modelType not in ('gss','full','student','circ','mix'):
+            raise Exception("modelType must be 'gss', 'full', 'student', 'circ', or 'mix'")
+        if self.model.covRank is not None:
+            if self.model.modelType not in ('gss','student','mix'):
+                raise Exception("covRank is used by modelType 'gss', 'student' and 'mix'")
+            if self.nrn.bFinalized and self.model.covRank>=self._nDim:
+                raise Exception('covRank (' + str(self.model.covRank) + ') must be below the number of response dimensions (' + str(self._nDim) + ')')
+        if self.model.nRef is not None and self.model.modelType!='full':
+            raise Exception("nRef is only used by modelType='full'")
+        if self.model.modelType=='full' and self.model.bLeaveOneOut and self.model.nRef is not None and self.model.nRef<2:
+            raise Exception('bLeaveOneOut with nRef needs nRef of at least 2')
+        if self.model.modelType=='mix':
+            if self.model.ctgPoolWidth is not None or self.model.covShrink>0:
+                raise Exception("modelType='mix' does not use ctgPoolWidth or covShrink (use mixReg)")
+            if np.any(counts<2*self.model.nMix):
+                raise Exception("modelType='mix' needs at least 2*nMix stimuli in every category (fewest: " + str(int(counts.min())) + ')')
         if self.model.modelType=='full' and self.nrn.corrType=='None':
             raise Exception("modelType='full' needs response noise; rho=None (no noise) is only supported with modelType='gss'")
         if self.nrn.corrType=='corr' and self.nrn.bFinalized:
             nDim=self._nDim
-            lo=-1/(nDim-1) if nDim>1 else -np.inf
-            if not (lo < self.nrn.rho < 1):
-                raise Exception('rho must be in (' + str(lo) + ', 1) for ' + str(nDim) + ' response dimensions')
+            rho=self.nrn.rho
+            if np.ndim(rho)>0:
+                if rho.shape!=(nDim,nDim):
+                    raise Exception('the rho matrix must be ' + str(nDim) + ' x ' + str(nDim) + ' (the flattened response dimensions)')
+                if not (np.allclose(rho,rho.T) and np.allclose(np.diag(rho),1) and np.linalg.eigvalsh(rho).min()>0):
+                    raise Exception('the rho matrix must be a correlation matrix: symmetric, unit diagonal, positive definite')
+            else:
+                lo=-1/(nDim-1) if nDim>1 else -np.inf
+                if not (lo < rho < 1):
+                    raise Exception('rho must be in (' + str(lo) + ', 1) for ' + str(nDim) + ' response dimensions')
         if self.nrn._bWhiten:
             if str(self.nrn.whitenType).lower() not in ('gram','response'):
                 raise Exception("whitenType must be 'None', 'gram', or 'response'")
@@ -2073,13 +2975,26 @@ class Unit(_Static):
             raise Exception('stage-1 noise (bNoise_1) is not modeled through a pooled readout')
         if self.nrn.bReadout and self.nrn._bWhiten:
             raise Exception('a pooled readout can not be combined with whitening')
+        nDim,per=getattr(self.stim,'nDim',1),getattr(self.stim,'Yperiod',None)
+        if self.objective.errType=='fisher' and nDim>1 and self.objective._Ygrid is None:
+            raise Exception("errType='fisher' with several latent dimensions needs the levels (Y) on a cartesian grid")
+        if per is not None:
+            Yv=np.asarray(self.stim.Y).reshape(len(self.stim.Y),-1)
+            for d,P in enumerate(per):
+                if P is not None and np.ptp(Yv[:,d])>=P:
+                    raise Exception('latent values of circular dimension ' + str(d) + ' must span less than its period (' + str(P) + ')')
+        if self.objective.estType=='cmean' and nDim>1:
+            raise Exception("estType='cmean' needs a single latent dimension; set Stim Yperiod and use 'mean'")
         if self.model.bLeaveOneOut:
-            if self.model.modelType!='full':
-                raise Exception("bLeaveOneOut is only implemented for modelType='full'")
             if self.objective.errType=='mle':
                 raise Exception("bLeaveOneOut defines a leave-one-out posterior and can not be used with errType='mle'")
-            if np.any(counts<2):
-                raise Exception('bLeaveOneOut needs at least 2 stimuli in every category')
+            nMin=self._loo_min_count()
+            if np.any(counts<nMin):
+                raise Exception('bLeaveOneOut with modelType=' + repr(self.model.modelType) + ' needs at least ' + str(nMin) + ' stimuli in every category')
+        if self.nrn.bNoise_1 and str(self.nrn.normalizeType).lower()=='phase':
+            raise Exception("stage-1 noise (bNoise_1) is not modeled through normalizeType='phase', which is not linear")
+        if self.nrn.corrType!='None' and not self.nrn.var0>0:
+            raise Exception('var0 must be positive: the noise variance fano*|r| + var0 is otherwise 0 for zero responses')
         if (self.nrn.bNoise_1 and str(self.nrn.normalizeType).lower()=='gen' and self.nrn.bFinalized
                 and self.nrn.bAnalytic and not self.nrn._bWhiten):
             raise Exception("stage-1 noise (bNoise_1) with normalizeType='gen' is only modeled for real responses (not fourierType=2)")
@@ -2103,19 +3018,28 @@ class Unit(_Static):
             return self._loss_fun_heldout(full,self.rng,test.val,test.weights,test.yCtg,test.Y,self.stim.val,self.stim.weights)
         return fun
 
+    def _opt_key(self,shape):
+        # what an optimizer state belongs to: the learned filter columns, their parameter shape, the optimizer, the precision
+        ind=self.filter.index
+        cols=tuple(int(c) for c in np.sort(np.concatenate((ind.ind_lrn,ind.ind_rec))))
+        return (tuple(shape),cols,str(self.optimizer.optimizerType),np.dtype(self.nrn.dtype).name)
+
     def _run(self,f0,rng,opt_state=None,stimVal=None):
         self._check_batches()
         extra={'p':self._p0()} if self.nrn.bReadout else None
         val_fun=None if stimVal is None else self._val_fun(stimVal)
         self.out_params,self.opt_state,self.rng_last=self.optimizer.minimize(f0,rng,self.stim,self.filter,_BoundLoss(self,'_loss_fun_lrn'),
-                                                                             opt_state=opt_state,extra_params=extra,val_fun=val_fun)
+                                                                             opt_state=opt_state,extra_params=extra,val_fun=val_fun,
+                                                                             mstate0=self._mix_state0(f0))
         self._opt_param_shape=self.out_params['f'].shape
+        self._opt_state_key=self._opt_key(self._opt_param_shape)
         self.filter.extract(self.out_params['f'])
         if 'p' in self.out_params:
             self.pool_p=np.asarray(self.out_params['p'])
 
     def _train_random(self,rng,nRestarts,stimVal=None):
-        # learn from random initial filters; with restarts, keep the run with the lowest cost on the training stimuli
+        # learn from random initial filters; with restarts, keep the run with the lowest cost on the validation stimuli
+        # (stimVal) if given, else on the training stimuli. restart_costs holds those costs
         if nRestarts<1:
             raise Exception('nRestarts must be at least 1')
         self.restart_costs=[]
@@ -2129,12 +3053,14 @@ class Unit(_Static):
             if nRestarts==1:
                 self.restart_costs=None
                 return
-            cost=float(self.loss)
+            cost=float(self.loss) if stimVal is None else self.evaluate(stimVal)
             self.restart_costs.append(cost)
             if best is None or cost<best[0]:
                 best=(cost,jnp.asarray(self.filter.out),self.out_params,self.opt_state,self.rng_last,
-                      list(self.optimizer.loss_hist),self._opt_param_shape,self.pool_p)
-        _,self.filter.out,self.out_params,self.opt_state,self.rng_last,self.optimizer.loss_hist,self._opt_param_shape,self.pool_p=best
+                      list(self.optimizer.loss_hist),list(self.optimizer.val_hist),self.optimizer.best_step,
+                      self._opt_param_shape,self._opt_state_key,self.pool_p)
+        (_,self.filter.out,self.out_params,self.opt_state,self.rng_last,self.optimizer.loss_hist,self.optimizer.val_hist,
+         self.optimizer.best_step,self._opt_param_shape,self._opt_state_key,self.pool_p)=best
 
     @_logged_training
     def train_new(self,n,fourierType=None,bSplit=None,stimInd=None,dtype=None,optimizer=None,nRestarts=1,stimVal=None):
@@ -2179,7 +3105,7 @@ class Unit(_Static):
         )
 
         f0=self.filter.out_flat[self.filter._insert_index_jx]
-        opt_state=self.opt_state if getattr(self,'_opt_param_shape',None)==f0.shape else None
+        opt_state=self.opt_state if getattr(self,'_opt_state_key',None)==self._opt_key(f0.shape) else None
 
         rng,_ = jxrandom.split(self.rng if self.rng_last is None else self.rng_last)
         self._run(f0,rng,opt_state,stimVal=stimVal)
@@ -2258,64 +3184,50 @@ class Unit(_Static):
         f=jnp.zeros((int(np.prod(pix_dims)),n),dtype=self.nrn.dtype)
         return f.at[flt.index.pix].set(prof.astype(self.nrn.dtype))
 
-    def _train_generated(self,params,build,penalty=None,stimVal=None):
+    def _train_generated(self,params,kind,cfg,stimVal=None):
         """
-        optimize params (a dict of arrays; 'p' holds readout pooling weights) of filters f=build(params) [ nPix x nF ] on
-        this unit's cost, plus penalty(params) if given, with this unit's Optimizer (optimizerType, lRate0, nIterMax,
-        nStepsPerChunk, bVerbose, patience with stimVal). Returns the final (or best validation) params.
+        optimize params (a dict of arrays; 'p' holds readout pooling weights) of the filters generated by kind ('parametric'
+        or 'multiscale', see _generated_filters) with configuration cfg, on this unit's cost plus the generator's penalty,
+        with this unit's Optimizer (optimizerType, lRate0, nIterMax, nStepsPerChunk, batchSize, bVerbose, patience with
+        stimVal). Returns the final (or best validation) params.
         """
-        opt=self.optimizer
-        tx=opt.tx
-        stim=self.stim
-
-        def full(prm):
-            out={'f':build(prm)}
-            if 'p' in prm:
-                out['p']=prm['p']
-            return out
-
-        def loss(prm):
-            cost=self._loss_fun(full(prm),self.rng,stim.val,stim.weights,stim.yCtg,stim.Y,None)
-            return cost if penalty is None else cost+penalty(prm)
-
-        step_fun=jit(value_and_grad(loss))
+        loss=_GeneratedLoss(self,kind,cfg)
         val_fun=None
         if stimVal is not None:
             test=self._prepare_stim(stimVal)
-            val_fun=jit(lambda prm: self._loss_fun_heldout(full(prm),self.rng,test.val,test.weights,test.yCtg,test.Y,
-                                                          stim.val,stim.weights))
-
-        opt_state=tx.init(params)
-        opt.loss_hist,opt.val_hist,opt.best_step=[],[],None
-        best,nBad=None,0
-        for it in range(opt.nIterMax):
-            value,grads=step_fun(params)
-            # complex params: jax returns the conjugate of the ascent direction
-            grads=tree_util.tree_map(jnp.conjugate,grads)
-            updates,opt_state=tx.update(grads,opt_state,params)
-            params=optax.apply_updates(params,updates)
-            opt.loss_hist.append(float(value))
-            if (it+1) % max(1,opt.nStepsPerChunk)==0 or it==opt.nIterMax-1:
-                if opt.bVerbose:
-                    print(f'step {it}, loss: {float(value)}')
-                if val_fun is not None:
-                    v=float(val_fun(params))
-                    opt.val_hist.append(v)
-                    if best is None or v<best[0]:
-                        best,nBad=(v,params,it),0
-                    else:
-                        nBad+=1
-                    if opt.patience is not None and nBad>=opt.patience:
-                        break
-        if best is not None:
-            _,params,opt.best_step=best
+            val_fun=lambda prm: _generated_heldout(loss,prm,self.rng,test.val,test.weights,test.yCtg,test.Y,
+                                                   self.stim.val,self.stim.weights)
+        rng,_=jxrandom.split(self.rng)
+        params,self.rng_last=self.optimizer.minimize_generated(params,rng,self.stim,loss,val_fun)
         return params
+
+    def _generated_filters(self,kind,params,cfg):
+        # filters [ nPix x nF ] generated from params
+        if kind=='parametric':
+            return self._parametric_filters(params,cfg['family'],cfg['n'],cfg['bTied'],cfg['orientations'])
+        return self._multiscale_filters(params,cfg['nTot'],cfg)
+
+    def _generated_penalty(self,kind,params,cfg):
+        # multiscale knotSmooth: squared second differences of each mother's tapered knots, relative to its energy
+        if kind!='multiscale' or not cfg['knotSmooth']>0:
+            return None
+        nMothers=cfg['nMothers']
+        tm=self._tapered_mothers(params,cfg)
+        energy=jnp.sum((jnp.abs(tm)**2).reshape(nMothers,-1),axis=1)+1e-12
+        tot=0.
+        for v in (jnp.real(tm),jnp.imag(tm)):
+            d=jnp.sum((jnp.diff(v,n=2,axis=1)**2).reshape(nMothers,-1),axis=1)
+            if tm.ndim==3:                                                   # 2D: also along angle
+                d=d+jnp.sum((jnp.diff(v,n=2,axis=2)**2).reshape(nMothers,-1),axis=1)
+            tot=tot+jnp.sum(d/energy)
+        return cfg['knotSmooth']*tot
 
     def _set_generated(self,f,params):
         # generated filters [ nPix x nF ] become this unit's ordinary filters
         self.filter.out=jnp.reshape(f,self.filter._shape_exp)
         self.out_params={'f':f[self.filter._insert_index_jx]}
         self._opt_param_shape=self.out_params['f'].shape
+        self._opt_state_key=None
         self.opt_state=None
         if 'p' in params:
             self.pool_p=np.asarray(params['p'])
@@ -2502,7 +3414,7 @@ class Unit(_Static):
         rd=jnp.finfo(self.nrn.dtype).dtype
         cfg=dict(scaleType=scaleType,uWidth=float(uWidth),nKnot=int(nKnot),nKnotTheta=int(nKnotTheta),
                  orientations=orientations,kPeak=kPeak0,scaleExp=scaleExp,nMothers=nMothers,
-                 knotTaper=self._knot_taper(int(nKnot),float(edgeTaper)))
+                 knotTaper=self._knot_taper(int(nKnot),float(edgeTaper)),nTot=nTot,knotSmooth=float(knotSmooth))
 
         ug=np.linspace(-uWidth,uWidth,nKnot)
         if init=='loggabor':
@@ -2531,23 +3443,8 @@ class Unit(_Static):
         if self.nrn.bReadout:
             params['p']=self._p0()
 
-        penalty=None
-        if knotSmooth>0:
-            def penalty(prm):
-                tot=0.
-                # per mother, relative to that mother's energy (scale-free), on the tapered knots
-                tm=self._tapered_mothers(prm,cfg)
-                energy=jnp.sum((jnp.abs(tm)**2).reshape(nMothers,-1),axis=1)+1e-12
-                for v in (jnp.real(tm),jnp.imag(tm)):
-                    d=jnp.sum((jnp.diff(v,n=2,axis=1)**2).reshape(nMothers,-1),axis=1)
-                    if b2D:
-                        d=d+jnp.sum((jnp.diff(v,n=2,axis=2)**2).reshape(nMothers,-1),axis=1)
-                    tot=tot+jnp.sum(d/energy)
-                return knotSmooth*tot
-
-        build=lambda prm: self._multiscale_filters(prm,nTot,cfg)
-        params=self._train_generated(params,build,penalty=penalty,stimVal=stimVal)
-        self._set_generated(build(params),params)
+        params=self._train_generated(params,'multiscale',cfg,stimVal=stimVal)
+        self._set_generated(self._generated_filters('multiscale',params,cfg),params)
 
         mother=np.asarray(self._tapered_mothers(params,cfg))
         if nMothers==1:
@@ -2612,10 +3509,9 @@ class Unit(_Static):
         params=self._parametric_init(family,n,bTied,init,b2D)
         if self.nrn.bReadout:
             params['p']=self._p0()
-        params=self._train_generated(params,lambda prm: self._parametric_filters(prm,family,n,bTied,orientations),
-                                     stimVal=stimVal)
-        f=self._parametric_filters(params,family,n,bTied,orientations)
-        self._set_generated(f,params)
+        cfg=dict(family=family,n=n,bTied=bTied,orientations=orientations)
+        params=self._train_generated(params,'parametric',cfg,stimVal=stimVal)
+        self._set_generated(self._generated_filters('parametric',params,cfg),params)
         e=lambda k: np.exp(np.asarray(params[k]))
         out={'family':family,'bTied':bTied,'fourierType':fourierType}
         if bTied:
@@ -2637,8 +3533,11 @@ class Unit(_Static):
         # other stimuli in this unit's learning domain and precision
         if not self.nrn.bFinalized:
             raise Exception('train (or finalize) the unit first')
-        if stim.nCtg!=self.stim.nCtg or not np.allclose(np.asarray(stim.Y),np.asarray(self.stim.Y)):
+        if (stim.nCtg!=self.stim.nCtg or np.shape(stim.Y)!=np.shape(self.stim.Y)
+                or not np.allclose(np.asarray(stim.Y),np.asarray(self.stim.Y))):
             raise Exception('stimuli must have the same categories (Y) as the training stimuli')
+        if getattr(stim,'Yperiod',None)!=getattr(self.stim,'Yperiod',None):
+            raise Exception('stimuli must have the same Yperiod as the training stimuli')
         return copy.copy(stim)._finalize(self.nrn.dtype,None,self.nrn.bFourier,self.nrn.bSplit)
 
     @partial(jit, static_argnames=['self'])
@@ -2672,34 +3571,34 @@ class Unit(_Static):
 
     def estimates(self,estType='mode',stim=None):
         """
-        estimates of the latent variable [ nStim_Ctg x nCtg ] (grouped like Stim.val; see Stim.weights) for the training
-        stimuli, or for other stimuli decoded with the training set: 'mode' (MAP), 'mean' (MMSE), 'median', or
-        'cmean' (circular mean, Y in radians)
+        estimates of the latent variable [ nStim_Ctg x nCtg (x nDim) ] (grouped like Stim.val; see Stim.weights) for the
+        training stimuli, or for other stimuli decoded with the training set: 'mode' (MAP), 'mean' (MMSE; circular on
+        circular dimensions), 'median', or 'cmean' (circular mean, Y in radians)
         """
         lpost,st=self._log_posterior(stim)
-        return np.asarray(getattr(Objective,'_est__'+estType)(lpost,st.Y))
+        return np.asarray(getattr(Objective,'_est__'+estType)(lpost,st.Y,st.Yperiod))
 
     def performance(self,estType='mode',stim=None):
         """
         estimation performance per latent level for the training stimuli, or for other stimuli decoded with the training
-        set: bias, sd, and rmse of the estimates; pCorrect and confusion [ true x MAP category ] of the MAP category;
-        and cost, the mean -log posterior at the correct level
+        set: bias, sd, and rmse of the estimates ([ nCtg (x nDim) ]; errors wrap on circular dimensions); pCorrect and
+        confusion [ true x MAP category ] of the MAP category; and cost, the mean -log posterior at the correct level
         """
         lpost,st=self._log_posterior(stim)
         lpost=np.asarray(lpost)
-        est=np.asarray(getattr(Objective,'_est__'+estType)(jnp.asarray(lpost),st.Y))
+        est=np.asarray(getattr(Objective,'_est__'+estType)(jnp.asarray(lpost),st.Y,st.Yperiod))
         w=np.asarray(st.weights)>0
         Y=np.asarray(st.Y)
         nCtg=len(Y)
         best=np.argmax(lpost,axis=-1)
         confusion=np.stack([np.bincount(best[w[:,c],c],minlength=nCtg) for c in range(nCtg)])
-        err=[est[w[:,c],c]-Y[c] for c in range(nCtg)]
+        err=[np.asarray(_wrap(jnp.asarray(est[w[:,c],c]-Y[c]),st.Yperiod)) for c in range(nCtg)]
         correct=np.diagonal(lpost,axis1=-2,axis2=-1)
         return {'Y':Y,
                 'estimates':est,
-                'bias':np.array([e.mean() for e in err]),
-                'sd':np.array([e.std() for e in err]),
-                'rmse':np.array([np.sqrt(np.mean(e**2)) for e in err]),
+                'bias':np.array([e.mean(0) for e in err]),
+                'sd':np.array([e.std(0) for e in err]),
+                'rmse':np.array([np.sqrt(np.mean(e**2,0)) for e in err]),
                 'pCorrect':np.diagonal(confusion)/confusion.sum(1),
                 'confusion':confusion,
                 'cost':float(-correct[w].mean())}
@@ -2731,11 +3630,13 @@ class Unit(_Static):
                'objective':_get_copy_dict(self.objective),
                'optimizer':None if self.optimizer is None else _get_copy_dict(self.optimizer,['loss_hist','tx','val_hist','best_step']),
                'finalize':dict(n=self.filter.n,dtype=np.dtype(self.nrn.dtype).name,bFourier=self.nrn.bFourier,
-                               bAnalytic=bool(self.nrn.bAnalytic),bSplit=self.nrn.bSplit),
+                               bAnalytic=bool(self.nrn.bAnalytic),bSplit=self.nrn.bSplit,
+                               stimInd=getattr(self,'_stimInd',None)),
                'out':np.asarray(self.filter.out),
                'last':asnp(self.filter.last),
                'opt_state':asnp(self.opt_state),
                'opt_param_shape':getattr(self,'_opt_param_shape',None),
+               'opt_state_key':getattr(self,'_opt_state_key',None),
                'loss_hist':list(getattr(self.optimizer,'loss_hist',[])),
                'restart_costs':self.restart_costs,
                'seed':self.seed,
@@ -2766,13 +3667,15 @@ class Unit(_Static):
         fourierType=(2 if fin['bAnalytic'] else 1) if fin['bFourier'] else 0
         if unit.optimizer is None:
             unit.optimizer=Optimizer()
-        unit._finalize(fin['n'],np.arange(fin['n']),fourierType=fourierType,bSplit=fin['bSplit'],dtype=jnp.dtype(fin['dtype']))
+        unit._finalize(fin['n'],np.arange(fin['n']),fourierType=fourierType,bSplit=fin['bSplit'],dtype=jnp.dtype(fin['dtype']),
+                       stimInd=fin.get('stimInd'))
         if state['optimizer'] is None:
             unit.optimizer=None
         unit.filter.out=jnp.asarray(state['out'])
         unit.filter.last=asjnp(state['last'])
         unit.opt_state=asjnp(state['opt_state'])
         unit._opt_param_shape=state['opt_param_shape']
+        unit._opt_state_key=state.get('opt_state_key')                   # older saves: the state is not reused
         if unit.optimizer is not None:
             unit.optimizer.loss_hist=state['loss_hist']
         unit.restart_costs=state['restart_costs']
@@ -2790,7 +3693,8 @@ class Unit(_Static):
     def _stim_summary(self):
         st=self.stim_full
         return {'dims':[int(d) for d in st.dims],'nCtg':int(st.nCtg),'nStim':int(np.sum(np.asarray(st.weights)>0)),
-                'Y':_yaml_safe(np.asarray(st.Y)),'bIsFourier':bool(st.bIsFourier),'nSplit':int(st.nSplit or 0)}
+                'Y':_yaml_safe(np.asarray(st.Y)),'Yperiod':_yaml_safe(getattr(st,'Yperiod',None)),
+                'bIsFourier':bool(st.bIsFourier),'nSplit':int(st.nSplit or 0)}
 
     def config(self):
         """
@@ -2925,14 +3829,27 @@ class Unit(_Static):
 
     @property
     def error(self):
-        return self.objective._err_fun(self.objective._est_fun(self.posterior,self.stim.Y),self.stim.yCtg)
+        Y,per=self.stim.Y,self.objective._Yperiod
+        return self.objective._err_fun(self.objective._est_fun(self.posterior,Y,per),self.stim.yCtg,self.objective.log_target(Y),Y,per,
+                                       self.objective._err_opts())
 
     #- loss functions
-    def _likelihoods(self,nrn_out,stimweights,Y):
+    def _likelihoods(self,nrn_out,stimweights,Y,rng_ref=None,mstate=None):
         R,Rm,RVar=[_flatten_responses(x) for x in self.model._response_fun(*nrn_out)]
         noiseCov=self.nrn._corr_fun(RVar,stimweights,self.nrn.rho)
+        if mstate is not None:
+            # a mixture warm started from mstate: (likelihoods, the new fit)
+            return Model._mix_likelihoods(R,Rm,noiseCov,stimweights,self.model.bLeaveOneOut,self.model,mstate,RVar)
         noiseCorr=self.nrn.corr_matrix(R.shape[0],R.dtype) if self.nrn.corrType=='corr' else None
+        if rng_ref is not None:
+            # full AMA with nRef: decode against a random subset of the reference stimuli
+            idx=Model._ref_subset(rng_ref,stimweights,self.model.nRef)
+            take=lambda A: jnp.take_along_axis(A,jnp.broadcast_to(idx,A.shape[:-2]+idx.shape),axis=-2)
+            return self.model.lrn_main(R,take(Rm),take(RVar),noiseCov,noiseCorr,take(stimweights),Y,idx)
         return self.model.lrn_main(R,Rm,RVar,noiseCov,noiseCorr,stimweights,Y)
+
+    def _bRefSubset(self):
+        return self.model.modelType=='full' and self.model.nRef is not None
 
     def _likelihoods_heldout(self,obs_out,ref_out,refweights,Y):
         # observed responses of other stimuli, decoded against the reference (training) stimuli; no leave-one-out
@@ -2943,11 +3860,25 @@ class Unit(_Static):
         return self.model._model_fun(R,Rm,RVar,noiseCov,noiseCorr,refweights,False,self.model,Y)
 
     @partial(jit, static_argnames=['self'])
-    def _loss_fun_lrn(self,params,rng_key,prepped,index,stimval,stimweights,yCtg,Y):
-        cost=self.objective.lrn_main(self._likelihoods(self.nrn.lrn_main(rng_key,stimval,params['f'],prepped,index,stimweights,params.get('p')),stimweights,Y),stimweights,yCtg,Y)
+    def _loss_fun_lrn(self,params,rng_key,prepped,index,stimval,stimweights,yCtg,Y,mstate=None):
+        # the reference subset has its own key, so the response noise draws do not change with nRef
+        rng_ref=jxrandom.fold_in(rng_key,7) if self._bRefSubset() else None
+        lik=self._likelihoods(self.nrn.lrn_main(rng_key,stimval,params['f'],prepped,index,stimweights,params.get('p')),
+                              stimweights,Y,rng_ref,mstate)
+        lAll,mnew=lik if mstate is not None else (lik,None)
+        cost=self.objective.lrn_main(lAll,stimweights,yCtg,Y)
         if self.objective.regWeight>0 and str(self.objective.regType).lower()!='none':
             cost=cost+self.objective.regWeight*self._penalty(self.nrn.insert(params['f'],prepped,index))
-        return cost
+        return cost if mstate is None else (cost,mnew)
+
+    def _mix_state0(self,f0):
+        # the cold mixture fit at the initial filters, where a warm-started EM (Model bWarmEM) begins
+        if self.model.modelType!='mix' or not self.model.bWarmEM:
+            return None
+        out=self.nrn.lrn_main(self.rng,self.stim.val,f0,self.filter.prepped_jx,self.filter._insert_index_jx,self.stim.weights,
+                              None if not self.nrn.bReadout else jnp.asarray(self._p0()))
+        Rm=_flatten_responses(self.model._response_fun(*out)[1])
+        return tuple(lax.stop_gradient(v) for v in Model._mix_fit(Rm,self.stim.weights,self.model,bDetail=True)[1]['state'])
 
     @partial(jit, static_argnames=['self'])
     def _loss_fun(self,params,rng_key,stimval,stimweights,yCtg,Y,W=None):
@@ -3167,7 +4098,8 @@ class Unit(_Static):
             k=min(per,idx.size)
             cols.append(np.stack([rng.choice(idx,k,replace=False),np.full(k,c)],1))
         sel=np.concatenate(cols)
-        lat=np.asarray(st.Y)[sel[:,1]]
+        Yv=np.asarray(st.Y) if np.ndim(st.Y)==1 else np.asarray(st.Y)[:,0]      # color by the first latent dimension
+        lat=Yv[sel[:,1]]
         g=np.asarray(self.filter.implied_spatial())
         if self.filter.bSplit:
             # each sub-filter (e.g. one eye) responds as its own neuron: [ nSplit x nF ] response dimensions
@@ -3182,8 +4114,8 @@ class Unit(_Static):
         u=r/np.maximum(np.abs(r),1e-12) if self.nrn.normalizeType=='phase' else r
         feats=(np.concatenate([u.real,u.imag],0) if np.iscomplexobj(u) else u).T
         if cmap is None:
-            Yv=np.asarray(st.Y)
-            cmap='twilight' if Yv.min()>=0 and Yv.max()<2*np.pi+1e-9 and np.ptp(Yv)>np.pi else 'viridis'
+            bCirc=getattr(st,'Yperiod',None) is not None and st.Yperiod[0] is not None
+            cmap='twilight' if bCirc or (Yv.min()>=0 and Yv.max()<2*np.pi+1e-9 and np.ptp(Yv)>np.pi) else 'viridis'
         return feats,u,lat,cmap
 
     def plot_response_embeddings(self,stim,methods=('tsne','pacmap','phate'),fname=None,name=None,nMax=2000,seed=0,cmap=None,

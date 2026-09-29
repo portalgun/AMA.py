@@ -2,9 +2,9 @@
 Learn AMA-Gauss filters for binocular disparity estimation on the burgelab training set (AMAdataDisparity.mat),
 evaluate them on held-out stimuli, save them, and plot them.
 
-Run from the repository root, with Filter.py on the python path:
+Run from the repository root:
 
-    PYTHONPATH=../Filter.py python examples/quickstart.py
+    python examples/quickstart.py
 
 Environment variables (optional): AMA_EXAMPLE_ITERS (iterations per training call, default 300) and
 AMA_EXAMPLE_OUT (directory for the saved unit, default the current directory).
