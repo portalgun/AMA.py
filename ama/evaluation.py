@@ -77,7 +77,9 @@ class _Evaluation:
         estimates of the latent variable [ nStim_Ctg x nCtg (x nDim) ] (grouped like Stim.val; see Stim.weights) for the
         training stimuli, or for other stimuli decoded with the training set: 'mode' (MAP), 'mean' (MMSE; circular on
         circular dimensions), 'median', or 'cmean' (circular mean, Y in radians). With Model bWithin, continuous
-        estimates within the categories. model: decode with this Model instead of the unit's (see evaluate)
+        estimates within the categories. model: decode with this Model instead of the unit's (see evaluate). With
+        noisy observations (responseType 'basic'), one noise draw (the unit's key), not the nNoiseSamples average of loss
+        and evaluate
         """
         lpost,st,Yc=self._decoder(model)._log_posterior(stim)
         return np.asarray(getattr(Objective,'_est__'+estType)(lpost,st.Y,st.Yperiod,Yc))
@@ -89,7 +91,8 @@ class _Evaluation:
         stimuli (rmseAll); pCorrect and confusion [ true x MAP category ] of the MAP category; and cost, the mean -log
         posterior at the correct level. Errors are measured from each stimulus's own latent value (Stim y), which for
         stimuli without their own values is their category's level. model: decode with this Model instead of the unit's
-        (see evaluate)
+        (see evaluate). With noisy observations (responseType 'basic'), one noise draw (the unit's key): its cost is not
+        the nNoiseSamples average of loss and evaluate
         """
         lpost,st,Yc=self._decoder(model)._log_posterior(stim)
         lpost=np.asarray(lpost)

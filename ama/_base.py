@@ -125,6 +125,8 @@ def _logged_training(fn):
             if k=='stimVal':
                 rec[k]=None if v is None else {'given':True,'nStim':int(np.sum(np.asarray(v.weights)>0))}
             elif k=='optimizer':
+                # the optimizer in effect (the unit's own when none is given), so a replay does not use a later one
+                v=v if v is not None else getattr(self,'optimizer',None)
                 rec[k]=None if v is None else _yaml_safe(_get_copy_dict(v,_OPT_EXCL))
             elif k=='dtype':
                 rec[k]=None if v is None else np.dtype(v).name

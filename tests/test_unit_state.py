@@ -139,3 +139,47 @@ class TestGeneratedTraining:
             assert u.optimizer.best_step in (20,40)                    # iterations completed at the kept chunk
             assert len(u.optimizer.loss_hist)==40
             assert u.rng_last is not None
+
+
+class TestReviewRegressions:
+    def test_restarts_start_from_the_same_response_parameters(self,monkeypatch):
+        seen=[]
+        orig=ama.Unit._p0
+        def spy(self):
+            p=orig(self)
+            seen.append({k:np.asarray(v).copy() for k,v in p.items()})
+            return p
+        monkeypatch.setattr(ama.Unit,'_p0',spy)
+        u=mk(nrn=ama.Nrn(bBias=True),nIterMax=20)
+        u.train_new(2,nRestarts=3)
+        assert len(seen)==3
+        assert all(np.array_equal(p['bias'],seen[0]['bias']) for p in seen)
+
+    def test_config_replay_uses_the_optimizer_of_each_call(self):
+        x,s,ci,Y,_=ts.sine_frequency()
+        st=ama.Stim(x,s,ci,Y)
+        u=mk(st,nIterMax=30)
+        u.train_new(2,dtype=jnp.float64)
+        u.train_recurse(optimizer=ama.Optimizer(nIterMax=3,lRate0=0.01,bVerbose=False))
+        assert u.config()['train'][0]['args']['optimizer']['nIterMax']==30
+        w=ama.Unit.from_config(u.config(),st,bTrain=True)
+        assert np.isclose(float(w.loss),float(u.loss),rtol=1e-9) and np.allclose(np.asarray(w.out),np.asarray(u.out))
+
+    @pytest.mark.parametrize('first,then',[(dict(fourierType=1),dict(fourierType=0)),(dict(fourierType=1),dict(fourierType=2)),
+                                           (dict(bSplit=True),dict(bSplit=False))])
+    def test_kept_filters_can_not_change_domain_or_layout(self,first,then):
+        x,s,ci,Y,_=ts.binocular_shift() if 'bSplit' in first else ts.sine_frequency()
+        u=mk(ama.Stim(x,s,ci,Y,nSplit=2) if 'bSplit' in first else ama.Stim(x,s,ci,Y),nIterMax=5)
+        u.train_new(2,**first)
+        with pytest.raises(Exception,match='can not change fourierType or bSplit'):
+            u.train_append(1,**then)
+        with pytest.raises(Exception,match='can not change fourierType or bSplit'):
+            u.train_recurse(**then)
+        u.train_append(1)                                                    # the same domain still works
+
+    def test_optimizer_state_follows_the_lbfgs_memory(self):
+        u=mk(nIterMax=5,optimizerType='lbfgs')
+        u.train_new(2)
+        k=u._opt_state_key
+        u.optimizer=ama.Optimizer('lbfgs',nIterMax=5,lbfgsMemory=4,bVerbose=False)
+        assert u._opt_key(u._opt_param_shape)!=k

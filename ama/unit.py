@@ -110,6 +110,11 @@ class Unit(_Static,_Banks,_Evaluation,_Persistence,_Plotting):
 
         if bSplit is None:
             bSplit=self.nrn.bSplit if self.nrn.bFinalized else False
+        if last is not None and self.nrn.bFinalized and (bFourier!=self.nrn.bFourier or bool(bAnalytic)!=bool(self.nrn.bAnalytic)
+                                                         or bool(bSplit)!=bool(self.nrn.bSplit)):
+            # the kept filters are parameters of the current domain and layout, which the new one would misread
+            raise Exception('train_append and train_recurse keep the current filters: they can not change fourierType or '
+                            'bSplit (train_new can)')
 
         if dtype is None:
             if self.nrn.bFinalized and self.nrn.bFourier==bFourier:
@@ -328,7 +333,8 @@ class Unit(_Static,_Banks,_Evaluation,_Persistence,_Plotting):
         # what an optimizer state belongs to: the learned filter columns, their parameter shape, the optimizer, the precision
         ind=self.filter.index
         cols=tuple(int(c) for c in np.sort(np.concatenate((ind.ind_lrn,ind.ind_rec))))
-        return (tuple(shape),cols,str(self.optimizer.optimizerType),np.dtype(self.nrn.dtype).name)
+        return (tuple(shape),cols,str(self.optimizer.optimizerType),np.dtype(self.nrn.dtype).name,
+                getattr(self.optimizer,'lbfgsMemory',None))
 
     def _run(self,f0,rng,opt_state=None,stimVal=None):
         self._check_batches()
@@ -352,11 +358,13 @@ class Unit(_Static,_Banks,_Evaluation,_Persistence,_Plotting):
             raise Exception('nRestarts must be at least 1')
         self.restart_costs=[]
         best=None
+        p_start=(self.pool_p,self.nrn_p)       # every restart starts its response-model parameters from here
         for i in range(nRestarts):
             if i>0:
                 rng=jxrandom.fold_in(rng,i)
             rng,rng_key = jxrandom.split(rng)
             f0=self.filter.get_f0(rng_key,self.optimizer._f0_jxrand_fun)
+            self.pool_p,self.nrn_p=p_start
             self._run(f0,rng,stimVal=stimVal)
             if nRestarts==1:
                 self.restart_costs=None
@@ -366,9 +374,10 @@ class Unit(_Static,_Banks,_Evaluation,_Persistence,_Plotting):
             if best is None or cost<best[0]:
                 best=(cost,jnp.asarray(self.filter.out),self.out_params,self.opt_state,self.rng_last,
                       list(self.optimizer.loss_hist),list(self.optimizer.val_hist),self.optimizer.best_step,
-                      self._opt_param_shape,self._opt_state_key,self.pool_p,self.nrn_p)
+                      self._opt_param_shape,self._opt_state_key,self.pool_p,self.nrn_p,getattr(self.optimizer,'stop_reason',None))
         (_,self.filter.out,self.out_params,self.opt_state,self.rng_last,self.optimizer.loss_hist,self.optimizer.val_hist,
-         self.optimizer.best_step,self._opt_param_shape,self._opt_state_key,self.pool_p,self.nrn_p)=best
+         self.optimizer.best_step,self._opt_param_shape,self._opt_state_key,self.pool_p,self.nrn_p,
+         self.optimizer.stop_reason)=best
 
     @_logged_training
     def train_new(self,n,fourierType=None,bSplit=None,stimInd=None,dtype=None,optimizer=None,nRestarts=1,stimVal=None):
