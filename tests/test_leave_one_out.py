@@ -205,3 +205,100 @@ class TestParametricLeaveOneOut:
                       ama.Optimizer(nIterMax=1,batchSize=5,bVerbose=False))
         with pytest.raises(Exception,match='nBatchMinCtg'):
             unit.train_new(1)
+
+
+MODELS=[('gss',dict(),{}),('student',dict(df=6.),{}),
+        ('circ',dict(circMean='estimate'),dict(gen=ts.sine_frequency,n=2,fourierType=2)),
+        ('circ',dict(circMean='zero'),dict(gen=ts.sine_frequency,n=2,fourierType=2))]
+
+
+class TestRankOneLeaveOneOut:
+    """bLooNoise=False: the own category's noise covariance is kept, and the left-out likelihood is a rank-one downdate"""
+
+    @staticmethod
+    def inputs(modelType,kw,gen_kw,seed=5):
+        unit,R,Rm,RVar,noiseCov=model_inputs(modelType,bLeaveOneOut=True,bLooNoise=False,**kw,**gen_kw)
+        rng=np.random.default_rng(seed)
+        R=R+0.3*jnp.asarray(rng.standard_normal(R.shape))                   # observed responses away from the means
+        return unit,R,Rm,RVar,noiseCov
+
+    @pytest.mark.parametrize('modelType,kw,gen_kw',MODELS)
+    def test_matches_deletion(self,modelType,kw,gen_kw):
+        unit,R,Rm,RVar,noiseCov=self.inputs(modelType,kw,gen_kw)
+        assert ama.Model._loo_rank_one(unit.model)
+        w=unit.stim.weights
+        fun=getattr(ama.Model,'_model__'+modelType)
+        loo=np.asarray(fun(R,Rm,RVar,noiseCov,None,w,True,unit.model,unit.stim.Y))
+        Rn,N=np.asarray(R),np.asarray(noiseCov)
+        picks=PICKS if modelType!='circ' else [(0,0),(5,1),(11,2)]
+        for c,k in picks:
+            _,lp=loo_noise_prior(RVar,w,c,k)
+            if modelType=='circ':
+                h=Rn.shape[0]//2
+                Rmc=np.asarray(Rm)[:h]+1j*np.asarray(Rm)[h:]
+                mu,cov=loo_reference(Rmc,w,c,k,centered=kw['circMean']=='estimate')
+                C=cov+N[k,:h,:h]+N[k,h:,h:]
+                z=Rn[:h,c,k]+1j*Rn[h:,c,k]-mu
+                ref=-np.real(z.conj()@np.linalg.solve(C,z))-h*np.log(np.pi)-np.log(np.real(np.linalg.det(C)))
+            else:
+                mu,cov=loo_reference(Rm,w,c,k)
+                ref=(smvn(mu,cov+N[k]).logpdf(Rn[:,c,k]) if modelType=='gss' else
+                     smvt(mu,(cov+N[k])*(kw['df']-2)/kw['df'],df=kw['df']).logpdf(Rn[:,c,k]))
+            assert np.isclose(loo[c,k,k],ref+lp,rtol=1e-10)
+
+    @pytest.mark.parametrize('modelType,kw,gen_kw',MODELS[:2]+[(m,k,dict(g,gen=ts.unequal_counts) if m!='circ' else g) for m,k,g in MODELS[:1]])
+    def test_matches_general_path_with_correlated_noise(self,modelType,kw,gen_kw,monkeypatch):
+        unit,R,Rm,RVar,_=self.inputs(modelType,kw,gen_kw)
+        n=R.shape[0]
+        A=np.random.default_rng(1).standard_normal((n,n))
+        noiseCov=jnp.asarray(A@A.T/n+0.2*np.eye(n))
+        w=unit.stim.weights
+        fun=getattr(ama.Model,'_model__'+modelType)
+        fast=np.asarray(fun(R,Rm,RVar,noiseCov,None,w,True,unit.model,unit.stim.Y))
+        monkeypatch.setattr(ama.Model,'_loo_rank_one',staticmethod(lambda m: False))
+        slow=np.asarray(fun(R,Rm,RVar,noiseCov,None,w,True,unit.model,unit.stim.Y))
+        valid=np.asarray(w)>0
+        assert np.all(np.isfinite(fast))
+        assert np.allclose(fast[valid],slow[valid],rtol=1e-10,atol=1e-10)
+
+    def test_general_path_otherwise(self):
+        for kw in (dict(covShrink=0.2),dict(covRank=1),dict(ctgPoolWidth=0.5),dict(bLooNoise=True)):
+            m=ama.Model('gss','mean',bLeaveOneOut=True,**dict(dict(bLooNoise=False),**kw))
+            assert not ama.Model._loo_rank_one(m)
+
+    def test_equals_exact_noise_without_response_dependent_noise(self):
+        """with fano=0 the noise variance does not depend on the stimulus, so bLooNoise does not change the likelihoods"""
+        x,s,ci,Y,_=ts.gaussian_ctg()
+        stim=ama.Stim(x,s,ci,Y)
+        costs=[]
+        for bLooNoise in (True,False):
+            unit=ama.Unit(stim,ama.Nrn(fano=0.),ama.Model('gss','mean',bLeaveOneOut=True,bLooNoise=bLooNoise),ama.Objective('map'),
+                          ama.Optimizer(nIterMax=1,bVerbose=False))
+            unit._finalize(3,np.arange(3),dtype=jnp.float64)
+            f=np.random.default_rng(0).standard_normal(unit.filter._shape)
+            unit.filter.out=jnp.asarray(f/np.linalg.norm(f,axis=0))
+            costs.append(float(unit.loss))
+        assert np.isclose(costs[0],costs[1],rtol=1e-12)
+
+    @pytest.mark.parametrize('modelType',['gss','student'])
+    def test_gradient_matches_finite_difference(self,modelType):
+        x,s,ci,Y,_=ts.gaussian_ctg()
+        unit=ama.Unit(ama.Stim(x,s,ci,Y),ama.Nrn(),ama.Model(modelType,'mean',bLeaveOneOut=True,bLooNoise=False),
+                      ama.Objective('map'),ama.Optimizer(nIterMax=1,bVerbose=False))
+        unit._finalize(2,np.arange(2),dtype=jnp.float64)
+        lf=lambda f: unit._loss_fun_lrn({'f':f},unit.rng,unit.filter.prepped_jx,unit.filter._insert_index_jx,
+                                        unit.stim.val,unit.stim.weights,unit.stim.yCtg,unit.stim.Y)
+        f=jnp.asarray(np.random.default_rng(2).standard_normal(unit.filter._shape))
+        g=jax.grad(lf)(f)
+        for idx in [(0,0),(9,1)]:
+            e=np.zeros(f.shape)
+            e[idx]=1e-6
+            assert np.isclose(g[idx],(lf(f+e)-lf(f-e))/2e-6,rtol=1e-4,atol=1e-7)
+
+    def test_learning_with_batches(self):
+        x,s,ci,Y,_=ts.gaussian_ctg()
+        unit=ama.Unit(ama.Stim(x,s,ci,Y),ama.Nrn(),ama.Model('gss','mean',bLeaveOneOut=True,bLooNoise=False),ama.Objective('map'),
+                      ama.Optimizer(nIterMax=60,lRate0=0.05,batchSize=60,nBatchMinCtg=3,bVerbose=False))
+        unit.train_new(2)
+        h=np.asarray(unit.optimizer.loss_hist)
+        assert np.all(np.isfinite(h)) and h[-1]<h[0]

@@ -37,6 +37,14 @@ class TestMixture:
         mix=np.asarray(ama.Model._model__mix(R,Rm,RVar,noiseCov,None,w,False,ama.Model('mix',nMix=1,mixReg=0.),unit.stim.Y))
         assert np.allclose(mix,gss,rtol=1e-10,atol=1e-10)
 
+    def test_shrinkage_with_one_component_is_ama_gauss(self):
+        unit,R,Rm,RVar,noiseCov=model_inputs('gss',n=3)
+        w=unit.stim.weights
+        gss=np.asarray(ama.Model._model__gss(R,Rm,RVar,noiseCov,None,w,False,ama.Model('gss',covShrink=0.3),unit.stim.Y))
+        mix=np.asarray(ama.Model._model__mix(R,Rm,RVar,noiseCov,None,w,False,ama.Model('mix',nMix=1,mixReg=0.,covShrink=0.3),
+                                             unit.stim.Y))
+        assert np.allclose(mix,gss,rtol=1e-10,atol=1e-10)
+
     def test_em_matches_sklearn(self):
         rng=np.random.default_rng(0)
         # two well separated clusters per category, [ nF x nStim_Ctg x nCtg ]
@@ -105,7 +113,8 @@ class TestMixture:
 
     def test_validation(self):
         x,s,ci,Y,_=bimodal_ctg(nStimPerCtg=5)
-        for model,match in [(ama.Model('mix','mean',nMix=3),'2\\*nMix'),(ama.Model('mix','mean',ctgPoolWidth=1.),'ctgPoolWidth')]:
+        for model,match in [(ama.Model('mix','mean',nMix=3),'2\\*nMix'),
+                            (ama.Model('mix','mean',ctgPoolWidth=1.,bPoolMeans=True),'bPoolMeans')]:
             unit=ama.Unit(ama.Stim(x,s,ci,Y,bContrastNormalize=True),ama.Nrn(),model,ama.Objective('map'),
                           ama.Optimizer(nIterMax=1,bVerbose=False))
             with pytest.raises(Exception,match=match):
@@ -156,6 +165,17 @@ class TestWarmStart:
         lw,_=ama.Model._mix_likelihoods(R,Rm,noiseCov,w,False,ama.Model('mix',nMix=2,nEMWarm=2),state=fit)
         assert np.allclose(np.asarray(lw),np.asarray(lc),atol=1e-6)
 
+    def test_emptied_component_starts_again(self):
+        unit,R,Rm,RVar,noiseCov=model_inputs('gss',n=2)
+        w=unit.stim.weights
+        m=ama.Model('mix',nMix=2,nEM=30,nEMWarm=2)
+        lc,fit=ama.Model._mix_likelihoods(R,Rm,noiseCov,w,False,m)
+        pi,mu,cov=[np.array(a) for a in fit]
+        pi[1]=[1.,0.]                                                       # category 1: its second component emptied
+        lw,new=ama.Model._mix_likelihoods(R,Rm,noiseCov,w,False,m,state=tuple(jnp.asarray(a) for a in (pi,mu,cov)))
+        assert np.allclose(np.asarray(lw),np.asarray(lc),rtol=1e-10)       # the cold fit (nEM iterations) again
+        assert np.all(np.asarray(new[0])>1e-8)
+
     def warm_unit(self,**opt_kw):
         x,s,ci,Y,_=bimodal_ctg()
         return ama.Unit(ama.Stim(x,s,ci,Y,bContrastNormalize=True),ama.Nrn(),
@@ -181,3 +201,97 @@ class TestWarmStart:
         h=np.asarray(unit.optimizer.loss_hist)
         assert np.all(np.isfinite(h)) and np.mean(h[-10:])<np.mean(h[:10])
         assert np.isfinite(float(unit.loss))
+
+
+POOL=[dict(ctgPoolWidth=0.7),dict(covShrink=0.4,covTarget='pooled'),dict(ctgPoolWidth=0.5,covShrink=0.3,covTarget='pooled'),
+      dict(ctgPoolWidth=0.5,covShrink=0.3)]
+
+
+class TestMixturePooling:
+    @pytest.mark.parametrize('kw',POOL)
+    @pytest.mark.parametrize('loo',[False,True])
+    def test_one_component_is_pooled_ama_gauss(self,kw,loo):
+        unit,R,Rm,RVar,noiseCov=model_inputs('gss',n=3,**kw)
+        R=R+0.2*jnp.asarray(np.random.default_rng(0).standard_normal(R.shape))
+        w=unit.stim.weights
+        gss=np.asarray(ama.Model._model__gss(R,Rm,RVar,noiseCov,None,w,loo,ama.Model('gss',**kw),unit.stim.Y))
+        mix=np.asarray(ama.Model._model__mix(R,Rm,RVar,noiseCov,None,w,loo,ama.Model('mix',nMix=1,mixReg=0.,**kw),unit.stim.Y))
+        valid=np.asarray(w)>0
+        assert np.allclose(mix[valid],gss[valid],rtol=1e-9,atol=1e-9)
+
+    def test_components_borrow_in_proportion_to_their_weight(self):
+        unit,R,Rm,RVar,noiseCov=model_inputs('gss',n=2)
+        m=ama.Model('mix',nMix=2,mixReg=1e-3,ctgPoolWidth=0.8)
+        w=unit.stim.weights
+        (pi,mu,cov),det=ama.Model._mix_fit(Rm,w,m,bDetail=True,Y=unit.stim.Y)
+        pi,cov=np.asarray(pi),np.asarray(cov)
+        X,W,Y=np.transpose(np.asarray(Rm),(2,1,0)),np.asarray(w)>0,np.asarray(unit.stim.Y)
+        r,Nc,S=np.asarray(det['r']),np.asarray(det['Nc']),np.asarray(det['S'])
+        K=np.exp(-(Y[:,None]-Y[None])**2/(2*0.8**2))
+        for i in range(len(Y)):
+            P=sum(K[i,j]*np.cov(X[j,W[:,j]].T)*(W[:,j].sum()-1) for j in range(len(Y)) if j!=i)
+            Q=sum(K[i,j]*(W[:,j].sum()-1) for j in range(len(Y)) if j!=i)
+            for c in range(2):
+                ref=(S[i,c]+pi[i,c]*P)/(max(Nc[i,c]-1,Nc[i,c]/2)+pi[i,c]*Q)+np.asarray(det['ridge'])[i]*np.eye(2)
+                assert np.allclose(cov[i,c],ref,rtol=1e-10)
+
+    @pytest.mark.parametrize('kw',[dict(ctgPoolWidth=0.7),dict(ctgPoolWidth=0.6,covShrink=0.3,covTarget='pooled')])
+    def test_leave_one_out_matches_refitting_with_fixed_responsibilities(self,kw):
+        unit,R,Rm,RVar,noiseCov=model_inputs('gss',n=2)
+        m=ama.Model('mix',nMix=2,mixReg=1e-3,**kw)
+        w=unit.stim.weights
+        loo=np.asarray(ama.Model._model__mix(R,Rm,RVar,noiseCov,None,w,True,m,unit.stim.Y))
+        _,det=ama.Model._mix_fit(Rm,w,m,bDetail=True,Y=unit.stim.Y)
+        r,X=np.asarray(det['r']),np.transpose(np.asarray(Rm),(2,1,0))
+        Rn,W,Y,Nn=np.asarray(R),np.asarray(w)>0,np.asarray(unit.stim.Y),np.asarray(noiseCov)
+        nC=len(Y)
+        width=kw['ctgPoolWidth']
+        K=np.exp(-(Y[:,None]-Y[None])**2/(2*width**2))
+        s=kw.get('covShrink',0.)
+        for (l,k) in [(0,0),(7,2),(19,4)]:
+            keep=W.copy(); keep[l,k]=False
+            scat=[np.cov(X[j,keep[:,j]].T)*(keep[:,j].sum()-1) for j in range(nC)]
+            dofs=[keep[:,j].sum()-1 for j in range(nC)]
+            T=sum(scat)/sum(dofs)
+            ridge=np.asarray(det['ridge'])
+            for i in range(nC):
+                rr=r[i].copy()
+                if i==k:
+                    rr[l]=0
+                n=keep[:,i].sum()
+                P=sum(K[i,j]*scat[j] for j in range(nC) if j!=i)
+                Q=sum(K[i,j]*dofs[j] for j in range(nC) if j!=i)
+                NL,lp=loo_noise_prior(RVar,w,l,k)
+                N=NL if i==k else Nn[i]
+                terms=[]
+                for c in range(2):
+                    Nc=rr[:,c].sum()
+                    muc=(rr[:,c,None]*X[i]).sum(0)/Nc
+                    D=X[i]-muc
+                    Sc=(rr[:,c,None,None]*D[:,:,None]*D[:,None,:]).sum(0)
+                    pic=Nc/n
+                    C=(Sc+pic*P)/(max(Nc-1,Nc/2)+pic*Q)
+                    C=(1-s)*C+s*T if s else C
+                    terms.append(np.log(pic)+smvn(muc,C+ridge[i]*np.eye(2)+N).logpdf(Rn[:,l,k]))
+                ref=np.logaddexp(*terms)+(lp if i==k else 0.)
+                assert np.isclose(loo[l,k,i],ref,rtol=1e-9)
+
+    def test_basic_responses_leave_out_the_mean_response(self):
+        """leave-one-out removes the stimulus's mean response (what the fit is made of), not its noisy observed response"""
+        unit,R,Rm,RVar,noiseCov=model_inputs('gss',n=2)
+        Rb=R+0.5*jnp.asarray(np.random.default_rng(1).standard_normal(R.shape))
+        m=ama.Model('mix',nMix=1,mixReg=0.)
+        w=unit.stim.weights
+        mix=np.asarray(ama.Model._model__mix(Rb,Rm,RVar,noiseCov,None,w,True,m,unit.stim.Y))
+        gss=np.asarray(ama.Model._model__gss(Rb,Rm,RVar,noiseCov,None,w,True,ama.Model('gss'),unit.stim.Y))
+        valid=np.asarray(w)>0
+        assert np.allclose(mix[valid],gss[valid],rtol=1e-9,atol=1e-9)
+
+    def test_training_with_pooling(self):
+        x,s,ci,Y,_=bimodal_ctg()
+        unit=ama.Unit(ama.Stim(x,s,ci,Y,bContrastNormalize=True),ama.Nrn(),
+                      ama.Model('mix','mean',nMix=2,ctgPoolWidth=0.7,bLeaveOneOut=True),ama.Objective('map'),
+                      ama.Optimizer(nIterMax=60,lRate0=0.05,bVerbose=False))
+        unit.train_new(1)
+        h=np.asarray(unit.optimizer.loss_hist)
+        assert np.all(np.isfinite(h)) and h[-1]<h[0]

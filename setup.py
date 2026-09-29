@@ -8,7 +8,7 @@ setup(
     url='https://github.com/portalgun/AMA.py.git',
     py_modules=['ama','Filter'],
     install_requires=[
-        'optax @ https://github.com/google-deepmind/optax.git@b8c2e133319480509576a7280f851e9d6ec7dccf',
+        'optax>=0.2.8',                  # tested with 0.2.8 (optax.projections l2_sphere/l2_ball)
         'numpy>=2.0.2',
         'jax>=0.4.35',
         'scikit-learn>=1.5',

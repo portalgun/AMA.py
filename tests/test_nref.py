@@ -106,3 +106,20 @@ class TestChunks:
         chunked=np.asarray(ama.Model._model__full(*args))
         assert np.array_equal(np.isinf(whole),np.isinf(chunked))
         assert np.allclose(whole[np.isfinite(whole)],chunked[np.isfinite(chunked)],rtol=1e-12)
+
+    @pytest.mark.parametrize('bLeaveOneOut',[False,True])
+    def test_chunked_gradient_is_identical(self,bLeaveOneOut,monkeypatch):
+        # chunks are recomputed in the backward pass (jax.checkpoint), which must not change the gradient
+        unit=full_unit(bLeaveOneOut=bLeaveOneOut)
+        f0=unit.filter.out_flat
+        loss=lambda f: unit._loss_fun({'f':f},unit.rng,unit.stim.val,unit.stim.weights,unit.stim.yCtg,unit.stim.Y)
+        g=np.asarray(jax.grad(loss)(f0))
+        monkeypatch.setattr(ama,'_FULL_CHUNK',7*30*3)
+        unit2=full_unit(bLeaveOneOut=bLeaveOneOut)
+        out=lambda f: unit2.nrn.main(unit2.rng,unit2.stim.val,f,unit2.stim.weights)
+        def chunked(f):
+            R,Rm,RVar=[ama._flatten_responses(x) for x in unit2.model._response_fun(*out(f))]
+            noiseCov=unit2.nrn._corr_fun(RVar,unit2.stim.weights,unit2.nrn.rho)
+            lAll=ama.Model._model__full(R,Rm,RVar,noiseCov,None,unit2.stim.weights,bLeaveOneOut,unit2.model,unit2.stim.Y)
+            return unit2.objective.lrn_main(lAll,unit2.stim.weights,unit2.stim.yCtg,unit2.stim.Y)
+        assert np.allclose(np.asarray(jax.grad(chunked)(f0)),g,rtol=1e-10)

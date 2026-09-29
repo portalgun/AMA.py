@@ -6,3 +6,4 @@ _old/
 *.ipynb
 profile_output
 .jax_profile/
+AMAdataSpeed.mat

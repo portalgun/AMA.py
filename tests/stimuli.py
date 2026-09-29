@@ -122,3 +122,25 @@ def unequal_counts(nPix=12,counts=(10,30,20),seed=0):
     stimuli[0]+=2*Y[yCtgInd]
     x=filt.X(ndim=1,n=nPix,totS=1)
     return x,contrast_normalize(stimuli),yCtgInd+1,Y,{'counts':np.asarray(counts)}
+
+
+def continuous_gaussian(nPix=16,nStim=300,signal=0.8,period=None,seed=0):
+    """
+    A continuous latent variable y ~ uniform over [-1, 1] (or over [0, period) if circular) rotates the stimuli in the plane
+    of two known directions, by the angle pi/3 y (or 2 pi y / period), so the value survives contrast normalization.
+    info['direction'] is the direction whose response is monotonic in a linear y (sin of the angle).
+    Returns (x, stimuli, y, info): bin with ama.Stim.binned(x, stimuli, y, ...).
+    """
+    rng=np.random.default_rng(seed)
+    basis,_=np.linalg.qr(rng.standard_normal((nPix,nPix)))
+    D=basis[:,:2]-basis[:,:2].mean(0)
+    D,_=np.linalg.qr(D)
+    noise=rng.standard_normal((nPix,nStim))
+    noise=noise-D@(D.T@noise)
+    noise=noise/np.linalg.norm(noise,axis=0)
+    y=rng.uniform(-1,1,nStim) if period is None else rng.uniform(0,period,nStim)
+    ang=np.pi/3*y if period is None else 2*np.pi*y/period
+    sig=np.outer(D[:,0],np.cos(ang))+np.outer(D[:,1],np.sin(ang))
+    stimuli=signal*sig + (1-signal)*noise
+    x=filt.X(ndim=1,n=nPix,totS=1)
+    return x,contrast_normalize(stimuli),y,{'direction':D[:,1],'directions':D}
